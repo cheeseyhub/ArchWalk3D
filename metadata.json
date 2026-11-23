@@ -1,0 +1,6 @@
+{
+  "name": "ArchWalk 3D",
+  "description": "Convert architectural floor plans, building exteriors, and room photos into interactive, walkable 3D architectural models powered by Gemini Vision and Three.js.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

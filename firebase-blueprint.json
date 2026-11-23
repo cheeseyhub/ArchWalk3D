@@ -1,0 +1,186 @@
+{
+  "entities": {
+    "SavedBlueprint": {
+      "title": "SavedBlueprint",
+      "description": "A generated and normalized 3D architectural spatial blueprint persisted to Firestore for a signed-in user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user who generated and owns this architectural model.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the architectural model.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "inputMode": {
+          "type": "string",
+          "description": "Architectural image interpretation mode used to generate the blueprint.",
+          "enum": ["floor_plan", "exterior", "single_room"]
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Optional user design notes used during generation.",
+          "minLength": 0,
+          "maxLength": 600
+        },
+        "roof": {
+          "type": "object",
+          "description": "Roof configuration map containing style, hex color, and overhang in meters."
+        },
+        "rooms": {
+          "type": "array",
+          "description": "Bounded list of normalized architectural room definitions (1 to 40 rooms)."
+        },
+        "walls": {
+          "type": "array",
+          "description": "Bounded list of wall definitions with door/window openings (0 to 120 walls)."
+        },
+        "furniture": {
+          "type": "array",
+          "description": "Bounded list of composite furniture item placements including custom AI-generated pieces (0 to 150 items)."
+        },
+        "roomCount": {
+          "type": "number",
+          "description": "Cached room count for summary listing."
+        },
+        "areaSqMeters": {
+          "type": "number",
+          "description": "Cached floor area in square meters."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the blueprint was first saved."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the blueprint was last updated."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "inputMode",
+        "prompt",
+        "roof",
+        "rooms",
+        "walls",
+        "furniture",
+        "roomCount",
+        "areaSqMeters",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "FurnitureAsset": {
+      "title": "FurnitureAsset",
+      "description": "A prompt-generated 3D composite furniture asset stored in the user's reusable Firestore furniture catalog.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user who generated and owns this furniture piece.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the furniture piece.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "description": {
+          "type": "string",
+          "description": "Short architectural style and material description.",
+          "minLength": 0,
+          "maxLength": 240
+        },
+        "category": {
+          "type": "string",
+          "description": "Base furniture category.",
+          "enum": [
+            "sofa",
+            "bed",
+            "table",
+            "chair",
+            "desk",
+            "counter",
+            "toilet",
+            "sink",
+            "plant",
+            "tv_stand",
+            "custom"
+          ]
+        },
+        "prompt": {
+          "type": "string",
+          "description": "User prompt that generated this furniture batch.",
+          "minLength": 0,
+          "maxLength": 400
+        },
+        "width": {
+          "type": "number",
+          "description": "Bounding width along local X in meters (0.2 to 6.0)."
+        },
+        "depth": {
+          "type": "number",
+          "description": "Bounding depth along local Z in meters (0.2 to 4.5)."
+        },
+        "height": {
+          "type": "number",
+          "description": "Bounding height along local Y in meters (0.2 to 3.2)."
+        },
+        "color": {
+          "type": "string",
+          "description": "Primary hex color string.",
+          "minLength": 4,
+          "maxLength": 9
+        },
+        "parts": {
+          "type": "array",
+          "description": "Bounded list of 1 to 16 composite 3D primitive part definitions (native Firestore maps)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the furniture asset was generated."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "description",
+        "category",
+        "prompt",
+        "width",
+        "depth",
+        "height",
+        "color",
+        "parts",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/blueprints/{blueprintId}": {
+      "schema": {
+        "$ref": "#/entities/SavedBlueprint"
+      },
+      "description": "User-owned generated 3D architectural blueprints stored as native Firestore maps and lists."
+    },
+    "/furnitureAssets/{assetId}": {
+      "schema": {
+        "$ref": "#/entities/FurnitureAsset"
+      },
+      "description": "User-owned prompt-generated 3D furniture catalog pieces stored as native Firestore maps and lists."
+    }
+  }
+}

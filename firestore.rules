@@ -1,0 +1,197 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidRoof(roof) {
+      return roof is map
+        && roof.keys().hasAll(['style', 'color', 'overhang'])
+        && roof.keys().hasOnly(['style', 'color', 'overhang'])
+        && roof.style in ['flat', 'gabled']
+        && roof.color is string && roof.color.size() >= 4 && roof.color.size() <= 9
+        && roof.overhang is number && roof.overhang >= 0 && roof.overhang <= 3;
+    }
+
+    function isValidBlueprint(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'name',
+          'inputMode',
+          'prompt',
+          'roof',
+          'rooms',
+          'walls',
+          'furniture',
+          'roomCount',
+          'areaSqMeters',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'name',
+          'inputMode',
+          'prompt',
+          'roof',
+          'rooms',
+          'walls',
+          'furniture',
+          'roomCount',
+          'areaSqMeters',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.inputMode in ['floor_plan', 'exterior', 'single_room']
+        && data.prompt is string && data.prompt.size() <= 600
+        && isValidRoof(data.roof)
+        && data.rooms is list && data.rooms.size() >= 1 && data.rooms.size() <= 40 && data.rooms[0] is map
+        && data.walls is list && data.walls.size() <= 120 && (data.walls.size() == 0 || data.walls[0] is map)
+        && data.furniture is list && data.furniture.size() <= 150 && (data.furniture.size() == 0 || data.furniture[0] is map)
+        && data.roomCount is number && data.roomCount >= 1 && data.roomCount <= 40
+        && data.areaSqMeters is number && data.areaSqMeters > 0 && data.areaSqMeters <= 10000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFurnitureAsset(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'name',
+          'description',
+          'category',
+          'prompt',
+          'width',
+          'depth',
+          'height',
+          'color',
+          'parts',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'name',
+          'description',
+          'category',
+          'prompt',
+          'width',
+          'depth',
+          'height',
+          'color',
+          'parts',
+          'createdAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.description is string && data.description.size() <= 240
+        && data.category in [
+          'sofa',
+          'bed',
+          'table',
+          'chair',
+          'desk',
+          'counter',
+          'toilet',
+          'sink',
+          'plant',
+          'tv_stand',
+          'custom'
+        ]
+        && data.prompt is string && data.prompt.size() <= 400
+        && data.width is number && data.width >= 0.2 && data.width <= 6.0
+        && data.depth is number && data.depth >= 0.2 && data.depth <= 4.5
+        && data.height is number && data.height >= 0.2 && data.height <= 3.2
+        && data.color is string && data.color.size() >= 4 && data.color.size() <= 9
+        && data.parts is list && data.parts.size() >= 1 && data.parts.size() <= 16 && data.parts[0] is map
+        && data.createdAt is timestamp;
+    }
+
+    // Collection: /blueprints/{blueprintId}
+    match /blueprints/{blueprintId} {
+      // Single-document read restricted strictly to verified owner with hardened ID
+      allow get: if isVerifiedUser()
+        && isValidId(blueprintId)
+        && existing().ownerId == request.auth.uid;
+
+      // Secure List Query: enforces owner filter directly on resource.data with zero DB reads
+      allow list: if isVerifiedUser()
+        && resource.data.ownerId == request.auth.uid;
+
+      // Create: verified auth, strict payload schema, and server-enforced timestamps
+      allow create: if isVerifiedUser()
+        && isValidId(blueprintId)
+        && isValidBlueprint(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      // Update: action-based rename or furniture placement edits; immutable ownerId & createdAt
+      allow update: if isVerifiedUser()
+        && isValidId(blueprintId)
+        && isValidBlueprint(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Rename saved architectural model
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'updatedAt']) ||
+          // Action: Save furniture placements, rotations, or removals inside this building
+          incoming().diff(existing()).affectedKeys().hasOnly(['furniture', 'updatedAt'])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(blueprintId)
+        && existing().ownerId == request.auth.uid;
+    }
+
+    // Collection: /furnitureAssets/{assetId}
+    match /furnitureAssets/{assetId} {
+      allow get: if isVerifiedUser()
+        && isValidId(assetId)
+        && existing().ownerId == request.auth.uid;
+
+      allow list: if isVerifiedUser()
+        && resource.data.ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(assetId)
+        && isValidFurnitureAsset(incoming())
+        && incoming().createdAt == request.time;
+
+      // Generated furniture assets are immutable after creation (delete instead)
+      allow update: if false;
+
+      allow delete: if isVerifiedUser()
+        && isValidId(assetId)
+        && existing().ownerId == request.auth.uid;
+    }
+  }
+}
