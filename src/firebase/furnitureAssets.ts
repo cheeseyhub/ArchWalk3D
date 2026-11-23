@@ -188,3 +188,12 @@ export function saveLocalFurnitureCatalog(assets: GeneratedFurnitureAsset[]): vo
     // Ignore quota / privacy mode errors
   }
 }
+
+export function clearLocalFurnitureCatalog(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(LOCAL_FURNITURE_CACHE_KEY);
+  } catch {
+    // Ignore
+  }
+}

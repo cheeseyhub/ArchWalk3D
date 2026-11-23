@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
@@ -274,11 +275,86 @@ function writeSseEvent(res: express.Response, event: string, data: unknown): voi
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+function loadFirebaseWebApiKey(): string {
+  try {
+    const raw = fs.readFileSync(path.resolve(__dirname, 'firebase-applet-config.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { apiKey?: string };
+    return typeof parsed.apiKey === 'string' ? parsed.apiKey.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+const FIREBASE_WEB_API_KEY = loadFirebaseWebApiKey();
+
+/**
+ * Verifies the caller's Firebase Google Auth ID token via Identity Toolkit's
+ * accounts:lookup endpoint so unauthenticated API calls are rejected with 401.
+ */
+async function requireFirebaseAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+  const match = typeof authHeader === 'string' ? authHeader.match(/^Bearer\s+(.+)$/i) : null;
+  const idToken = match?.[1]?.trim();
+
+  if (!idToken) {
+    res.status(401).json({
+      error: 'Google sign-in is required to generate 3D models and furniture.',
+    });
+    return;
+  }
+
+  if (!FIREBASE_WEB_API_KEY) {
+    res.status(500).json({
+      error: 'Firebase authentication configuration is missing on the server.',
+    });
+    return;
+  }
+
+  try {
+    const verifyRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(FIREBASE_WEB_API_KEY)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      },
+    );
+
+    if (!verifyRes.ok) {
+      res.status(401).json({
+        error: 'Your Google session has expired or is invalid. Please sign in again.',
+      });
+      return;
+    }
+
+    const data = (await verifyRes.json()) as {
+      users?: Array<{ localId?: string; email?: string; disabled?: boolean }>;
+    };
+    const account = data.users?.[0];
+    if (!account?.localId || account.disabled) {
+      res.status(401).json({
+        error: 'Your Google account could not be verified. Please sign in again.',
+      });
+      return;
+    }
+
+    next();
+  } catch {
+    res.status(503).json({
+      error: 'Unable to verify Google authentication right now. Please try again.',
+    });
+  }
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '18mb' }));
 
-  app.post('/api/furniture/generate', async (req, res) => {
+  app.post('/api/furniture/generate', requireFirebaseAuth, async (req, res) => {
     try {
       const { prompt } = (req.body ?? {}) as { prompt?: string };
       const cleanedPrompt = typeof prompt === 'string' ? prompt.trim().slice(0, 400) : '';
@@ -339,7 +415,7 @@ CRITICAL 3D MODELING RULES:
     }
   });
 
-  app.post('/api/blueprint/generate-stream', async (req, res) => {
+  app.post('/api/blueprint/generate-stream', requireFirebaseAuth, async (req, res) => {
     const { imageBase64, mimeType, mode, prompt } = (req.body ?? {}) as {
       imageBase64?: string;
       mimeType?: string;
@@ -367,12 +443,23 @@ CRITICAL 3D MODELING RULES:
     res.flushHeaders();
 
     let clientClosed = false;
-    req.on('close', () => {
-      clientClosed = true;
+    // IMPORTANT: On POST requests in Node.js 16+, req emits 'close' as soon as
+    // express.json() finishes reading the request body. Track client aborts on
+    // the response stream instead (only true if closed before res.writableEnded).
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        clientClosed = true;
+      }
     });
 
     const startedAt = Date.now();
+    let lastWriteAt = startedAt;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+    const emitSse = (event: string, data: unknown) => {
+      lastWriteAt = Date.now();
+      writeSseEvent(res, event, data);
+    };
 
     const clearHeartbeat = () => {
       if (heartbeatTimer) {
@@ -384,12 +471,12 @@ CRITICAL 3D MODELING RULES:
     try {
       const ai = getGeminiClient();
 
-      writeSseEvent(res, 'stage', {
+      emitSse('stage', {
         stage: 'analyzing',
         message: 'Inspecting architectural image...',
       });
 
-      writeSseEvent(res, 'stage', {
+      emitSse('stage', {
         stage: 'reasoning',
         message: 'Planning spatial dimensions, walls & openings...',
       });
@@ -399,9 +486,11 @@ CRITICAL 3D MODELING RULES:
           clearHeartbeat();
           return;
         }
-        writeSseEvent(res, 'heartbeat', {
-          elapsedMs: Date.now() - startedAt,
-        });
+        if (Date.now() - lastWriteAt >= 1200) {
+          emitSse('heartbeat', {
+            elapsedMs: Date.now() - startedAt,
+          });
+        }
       }, 1200);
 
       const stream = await ai.models.generateContentStream({
@@ -442,8 +531,7 @@ CRITICAL 3D MODELING RULES:
         rawText += delta;
         if (!enteredStreaming) {
           enteredStreaming = true;
-          clearHeartbeat();
-          writeSseEvent(res, 'stage', {
+          emitSse('stage', {
             stage: 'streaming',
             message: 'Streaming rooms, walls & furniture geometry...',
           });
@@ -454,7 +542,7 @@ CRITICAL 3D MODELING RULES:
         if (sig !== lastSignature || rawText.length - lastEmittedChars >= 320) {
           lastSignature = sig;
           lastEmittedChars = rawText.length;
-          writeSseEvent(res, 'progress', {
+          emitSse('progress', {
             progress,
             elapsedMs: Date.now() - startedAt,
           });
@@ -467,9 +555,13 @@ CRITICAL 3D MODELING RULES:
         return;
       }
 
-      const trimmed = rawText.trim();
+      const trimmed = rawText
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/, '')
+        .trim();
       if (!trimmed) {
-        writeSseEvent(res, 'error', {
+        emitSse('error', {
           error:
             'The Gemini API returned an empty blueprint response. Please try again with a clearer image.',
         });
@@ -477,7 +569,7 @@ CRITICAL 3D MODELING RULES:
         return;
       }
 
-      writeSseEvent(res, 'stage', {
+      emitSse('stage', {
         stage: 'building',
         message: 'Validating architectural mesh & saving blueprint...',
       });
@@ -486,7 +578,7 @@ CRITICAL 3D MODELING RULES:
       try {
         parsed = JSON.parse(trimmed);
       } catch {
-        writeSseEvent(res, 'error', {
+        emitSse('error', {
           error: 'Failed to parse structured JSON from the model response. Please retry.',
         });
         res.end();
@@ -494,25 +586,25 @@ CRITICAL 3D MODELING RULES:
       }
 
       const blueprint = normalizeBlueprint(parsed);
-      writeSseEvent(res, 'complete', {
+      emitSse('complete', {
         blueprint,
         elapsedMs: Date.now() - startedAt,
       });
       res.end();
     } catch (err: unknown) {
       clearHeartbeat();
-      if (!clientClosed) {
+      if (!clientClosed && !res.writableEnded) {
         const message =
           err instanceof Error
             ? err.message
             : 'Unexpected server error while generating blueprint.';
-        writeSseEvent(res, 'error', { error: message });
+        emitSse('error', { error: message });
         res.end();
       }
     }
   });
 
-  app.post('/api/blueprint/generate', async (req, res) => {
+  app.post('/api/blueprint/generate', requireFirebaseAuth, async (req, res) => {
     try {
       const { imageBase64, mimeType, mode, prompt } = req.body as {
         imageBase64?: string;
@@ -561,7 +653,11 @@ CRITICAL 3D MODELING RULES:
         },
       });
 
-      const rawText = (response.text ?? '').trim();
+      const rawText = (response.text ?? '')
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/, '')
+        .trim();
       if (!rawText) {
         res.status(502).json({
           error: 'The Gemini API returned an empty blueprint response. Please try again with a clearer image.',

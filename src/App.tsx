@@ -5,6 +5,7 @@ import {
   STARTER_FURNITURE_ASSETS,
   createPlacedFurnitureItem,
 } from './arch/furnitureCatalog';
+import { SseStreamParser, type ParsedSseEvent } from './arch/sseParser';
 import type { BlueprintStreamProgress } from './arch/streamProgress';
 import type {
   BlueprintFurniture,
@@ -14,6 +15,7 @@ import type {
   SpatialBlueprint,
 } from './arch/types';
 import { ArchViewport, type TeleportRequest } from './components/ArchViewport';
+import { AuthGate } from './components/AuthGate';
 import {
   BuildProgressOverlay,
   type BuildProgressState,
@@ -24,6 +26,7 @@ import { StudioSidebar, type SidebarTab } from './components/StudioSidebar';
 import { ViewportToolbar } from './components/ViewportToolbar';
 import { WalkModeHud } from './components/WalkModeHud';
 import {
+  clearLocalCachedModel,
   deleteBlueprintFromFirestore,
   loadLocalCachedModel,
   saveBlueprintToFirestore,
@@ -34,6 +37,7 @@ import {
 } from './firebase/blueprints';
 import { auth, googleProvider } from './firebase/client';
 import {
+  clearLocalFurnitureCatalog,
   deleteFurnitureAssetFromFirestore,
   loadLocalFurnitureCatalog,
   saveFurnitureAssetsToFirestore,
@@ -78,30 +82,6 @@ function readFileAsBase64(file: File): Promise<{ base64: string; mimeType: strin
     reader.onerror = () => reject(new Error('Failed to read the selected image.'));
     reader.readAsDataURL(file);
   });
-}
-
-function parseSseEventBlock(block: string): { event: string; data: unknown } | null {
-  const lines = block.split('\n');
-  let eventName = 'message';
-  const dataLines: string[] = [];
-
-  for (const line of lines) {
-    if (line.startsWith('event:')) {
-      eventName = line.slice(6).trim();
-    } else if (line.startsWith('data:')) {
-      dataLines.push(line.slice(5).trim());
-    }
-  }
-
-  if (dataLines.length === 0) return null;
-  try {
-    return {
-      event: eventName,
-      data: JSON.parse(dataLines.join('\n')),
-    };
-  } catch {
-    return null;
-  }
 }
 
 export default function App() {
@@ -296,10 +276,30 @@ export default function App() {
   }, []);
 
   const handleSignOut = useCallback(async () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
     setErrorMessage(null);
+    setFurnitureError(null);
     try {
       await signOut(auth);
+      clearLocalCachedModel();
+      clearLocalFurnitureCatalog();
       setActiveSavedId(null);
+      setSavedModels([]);
+      setGeneratedFurnitureCatalog([]);
+      setPlacingAsset(null);
+      setBlueprint({ ...DEMO_HOUSE_BLUEPRINT });
+      setIsUsingDemo(true);
+      setActiveRoomId(null);
+      setCameraMode('orbit');
+      setShowRoof(true);
+      setImageFile(null);
+      setImagePreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setPrompt('');
+      setFurniturePrompt('');
     } catch (err: unknown) {
       setErrorMessage(err instanceof Error ? err.message : 'Unable to sign out.');
     }
@@ -398,11 +398,19 @@ export default function App() {
     setIsGenerating(true);
 
     try {
+      const currentUser = auth.currentUser;
+      if (!currentUser) {
+        throw new Error('Please sign in with Google to generate a 3D model.');
+      }
+      const idToken = await currentUser.getIdToken();
       const { base64, mimeType } = await readFileAsBase64(imageFile);
 
       const response = await fetch('/api/blueprint/generate-stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
         signal: controller.signal,
         body: JSON.stringify({
           imageBase64: base64,
@@ -425,69 +433,112 @@ export default function App() {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let buffer = '';
+      const sseParser = new SseStreamParser();
       let completedBlueprint: SpatialBlueprint | null = null;
       let streamError: string | null = null;
+
+      const handleParsedEvent = (parsed: ParsedSseEvent) => {
+        if (parsed.event === 'stage') {
+          const payload = parsed.data as { stage?: BuildStageId; message?: string };
+          setBuildProgress((prev) => ({
+            ...prev,
+            stage: payload.stage ?? prev.stage,
+            statusText: payload.message ?? prev.statusText,
+          }));
+        } else if (parsed.event === 'heartbeat') {
+          setBuildProgress((prev) => ({
+            ...prev,
+            statusText:
+              prev.stage === 'reasoning'
+                ? 'Analyzing architectural layout & calculating wall alignments...'
+                : prev.statusText,
+          }));
+        } else if (parsed.event === 'progress') {
+          const payload = parsed.data as { progress?: BlueprintStreamProgress };
+          if (payload.progress) {
+            const p = payload.progress;
+            const summaryParts: string[] = [];
+            if (p.roomsCount > 0) summaryParts.push(`${p.roomsCount} rooms`);
+            if (p.wallsCount > 0) summaryParts.push(`${p.wallsCount} walls`);
+            if (p.furnitureCount > 0) summaryParts.push(`${p.furnitureCount} items`);
+            setBuildProgress((prev) => ({
+              ...prev,
+              stage: 'streaming',
+              statusText:
+                summaryParts.length > 0
+                  ? `Drafting ${summaryParts.join(', ')}...`
+                  : 'Streaming architectural blueprint...',
+              stream: p,
+            }));
+          }
+        } else if (parsed.event === 'complete') {
+          const payload = parsed.data as { blueprint?: SpatialBlueprint };
+          if (payload.blueprint) {
+            completedBlueprint = payload.blueprint;
+          }
+        } else if (parsed.event === 'error') {
+          const payload = parsed.data as { error?: string };
+          streamError = payload.error || 'Blueprint generation failed.';
+        }
+      };
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const blocks = buffer.split('\n\n');
-        buffer = blocks.pop() ?? '';
-
-        for (const block of blocks) {
-          const parsed = parseSseEventBlock(block);
-          if (!parsed) continue;
-
-          if (parsed.event === 'stage') {
-            const payload = parsed.data as { stage?: BuildStageId; message?: string };
-            setBuildProgress((prev) => ({
-              ...prev,
-              stage: payload.stage ?? prev.stage,
-              statusText: payload.message ?? prev.statusText,
-            }));
-          } else if (parsed.event === 'heartbeat') {
-            setBuildProgress((prev) => ({
-              ...prev,
-              statusText:
-                prev.stage === 'reasoning'
-                  ? 'Analyzing architectural layout & calculating wall alignments...'
-                  : prev.statusText,
-            }));
-          } else if (parsed.event === 'progress') {
-            const payload = parsed.data as { progress?: BlueprintStreamProgress };
-            if (payload.progress) {
-              const p = payload.progress;
-              const summaryParts: string[] = [];
-              if (p.roomsCount > 0) summaryParts.push(`${p.roomsCount} rooms`);
-              if (p.wallsCount > 0) summaryParts.push(`${p.wallsCount} walls`);
-              if (p.furnitureCount > 0) summaryParts.push(`${p.furnitureCount} items`);
-              setBuildProgress((prev) => ({
-                ...prev,
-                stage: 'streaming',
-                statusText:
-                  summaryParts.length > 0
-                    ? `Drafting ${summaryParts.join(', ')}...`
-                    : 'Streaming architectural blueprint...',
-                stream: p,
-              }));
-            }
-          } else if (parsed.event === 'complete') {
-            const payload = parsed.data as { blueprint?: SpatialBlueprint };
-            if (payload.blueprint) {
-              completedBlueprint = payload.blueprint;
-            }
-          } else if (parsed.event === 'error') {
-            const payload = parsed.data as { error?: string };
-            streamError = payload.error || 'Blueprint generation failed.';
-          }
+        const textChunk = decoder.decode(value, { stream: true });
+        for (const parsed of sseParser.push(textChunk)) {
+          handleParsedEvent(parsed);
         }
+      }
+
+      // Flush any trailing multibyte UTF-8 sequence and final buffered SSE block at EOF
+      const trailingChunk = decoder.decode();
+      if (trailingChunk) {
+        for (const parsed of sseParser.push(trailingChunk)) {
+          handleParsedEvent(parsed);
+        }
+      }
+      for (const parsed of sseParser.flush()) {
+        handleParsedEvent(parsed);
       }
 
       if (streamError) {
         throw new Error(streamError);
+      }
+
+      // Fallback to standard JSON endpoint if an intermediary proxy closed SSE early
+      if (!completedBlueprint && !controller.signal.aborted) {
+        setBuildProgress((prev) => ({
+          ...prev,
+          stage: 'building',
+          statusText: 'Stream interrupted — retrying blueprint request...',
+        }));
+        const fallbackRes = await fetch('/api/blueprint/generate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          signal: controller.signal,
+          body: JSON.stringify({
+            imageBase64: base64,
+            mimeType,
+            mode: inputMode,
+            prompt: trimmedNotes,
+          }),
+        });
+        const fallbackJson = (await fallbackRes.json().catch(() => ({}))) as {
+          blueprint?: SpatialBlueprint;
+          error?: string;
+        };
+        if (!fallbackRes.ok || !fallbackJson.blueprint) {
+          throw new Error(
+            fallbackJson.error ||
+              'Generation finished without a blueprint payload. Please try again.',
+          );
+        }
+        completedBlueprint = fallbackJson.blueprint;
       }
 
       if (!completedBlueprint) {
@@ -567,9 +618,18 @@ export default function App() {
     setIsGeneratingFurniture(true);
 
     try {
+      const currentUser = auth.currentUser;
+      if (!currentUser) {
+        throw new Error('Please sign in with Google to generate custom furniture.');
+      }
+      const idToken = await currentUser.getIdToken();
+
       const response = await fetch('/api/furniture/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
         body: JSON.stringify({ prompt: cleaned }),
       });
 
@@ -594,13 +654,12 @@ export default function App() {
       });
       setFurniturePrompt('');
 
-      // Persist all generated furniture assets to Firestore when signed in
-      const currentUser = auth.currentUser;
-      if (currentUser) {
+      // Persist all generated furniture assets to Firestore
+      if (auth.currentUser) {
         setIsSyncingFurniture(true);
         try {
           const savedCloud = await saveFurnitureAssetsToFirestore(
-            currentUser.uid,
+            auth.currentUser.uid,
             generatedItems,
           );
           const savedMap = new Map(savedCloud.map((item) => [item.id, item]));
@@ -799,6 +858,18 @@ export default function App() {
     blueprint.rooms.find((r) => r.id === activeRoomId)?.name ?? null;
 
   const canSaveCurrentToDb = Boolean(user && !activeSavedId && !isUsingDemo);
+
+  // Mandatory Google Sign-In Gate: do not mount studio or 3D viewport until signed in
+  if (!authReady || !user) {
+    return (
+      <AuthGate
+        authReady={authReady}
+        isSigningIn={isSigningIn}
+        errorMessage={errorMessage}
+        onSignIn={handleSignIn}
+      />
+    );
+  }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#0d0f13] text-[#eceef2]">

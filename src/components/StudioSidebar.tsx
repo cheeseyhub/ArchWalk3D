@@ -11,7 +11,6 @@ import {
   ImagePlus,
   LayoutGrid,
   Loader2,
-  LogIn,
   LogOut,
   PanelLeftClose,
   Sparkles,
@@ -471,55 +470,20 @@ export function StudioSidebar({
               </h2>
             </div>
 
-            {authReady && user && (
-              <button
-                type="button"
-                onClick={onSignOut}
-                className="flex items-center gap-1 text-[11px] text-[#8a93a4] hover:text-white transition-colors whitespace-nowrap"
-              >
-                <LogOut className="w-3 h-3" aria-hidden="true" />
-                <span>Sign out</span>
-              </button>
-            )}
+            {isSavingToDb ? (
+              <span className="flex items-center gap-1 text-[11px] text-[#e2a960] shrink-0">
+                <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
+                <span>Saving...</span>
+              </span>
+            ) : activeSavedId ? (
+              <span className="flex items-center gap-1 text-[11px] text-[#9ca3af] shrink-0">
+                <Check className="w-3 h-3 text-[#e2a960]" aria-hidden="true" />
+                <span>Saved</span>
+              </span>
+            ) : null}
           </div>
 
-          {!authReady ? (
-            <p className="text-xs text-[#7c8494]">Connecting to studio library...</p>
-          ) : !user ? (
-            <div className="rounded-lg bg-[#0e1116] border border-white/[0.08] p-3 space-y-2.5">
-              <p className="text-xs text-[#9ca3af] leading-relaxed">
-                Sign in with Google to save generated houses to your database and reload them anytime.
-              </p>
-              <button
-                type="button"
-                onClick={onSignIn}
-                disabled={isSigningIn}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md bg-white/[0.07] hover:bg-white/[0.12] border border-white/[0.1] text-[#eceef2] text-xs font-medium transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#d99b4e]"
-              >
-                {isSigningIn ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
-                ) : (
-                  <LogIn className="w-3.5 h-3.5 text-[#e2a960]" aria-hidden="true" />
-                )}
-                <span>{isSigningIn ? 'Signing in...' : 'Sign in with Google'}</span>
-              </button>
-            </div>
-          ) : (
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between gap-2 text-[11px] text-[#8a93a4]">
-                <span className="truncate">{user.displayName || user.email}</span>
-                {isSavingToDb ? (
-                  <span className="flex items-center gap-1 text-[#e2a960] shrink-0">
-                    <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
-                    <span>Saving...</span>
-                  </span>
-                ) : activeSavedId ? (
-                  <span className="flex items-center gap-1 text-[#9ca3af] shrink-0">
-                    <Check className="w-3 h-3 text-[#e2a960]" aria-hidden="true" />
-                    <span>Saved</span>
-                  </span>
-                ) : null}
-              </div>
+          <div className="space-y-2.5">
 
               {canSaveCurrentToDb && (
                 <button
@@ -579,7 +543,6 @@ export function StudioSidebar({
                 </div>
               )}
             </div>
-          )}
         </section>
 
         <hr className="border-white/[0.08]" />
@@ -627,6 +590,43 @@ export function StudioSidebar({
           </>
         )}
       </div>
+
+      {/* Persistent Google Account Footer */}
+      {user && (
+        <div className="px-5 py-3 border-t border-white/[0.08] bg-[#101318] flex items-center justify-between gap-3 shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            {user.photoURL ? (
+              <img
+                src={user.photoURL}
+                alt={user.displayName || 'Google profile'}
+                referrerPolicy="no-referrer"
+                className="w-7 h-7 rounded-full border border-white/[0.15] object-cover shrink-0"
+              />
+            ) : (
+              <div className="w-7 h-7 rounded-full bg-[#d99b4e]/20 border border-[#d99b4e]/45 flex items-center justify-center text-xs font-semibold text-[#e2a960] shrink-0">
+                {(user.displayName || user.email || 'U').charAt(0).toUpperCase()}
+              </div>
+            )}
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-[#eceef2] truncate">
+                {user.displayName || 'Signed in'}
+              </p>
+              {user.email && (
+                <p className="text-[11px] text-[#8a93a4] truncate">{user.email}</p>
+              )}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={onSignOut}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.08] text-xs font-medium text-[#cbd5e1] hover:text-white transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#d99b4e]"
+          >
+            <LogOut className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>Sign out</span>
+          </button>
+        </div>
+      )}
     </aside>
   );
 }
