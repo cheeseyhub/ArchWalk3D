@@ -2,6 +2,10 @@ export type InputMode = 'floor_plan' | 'exterior' | 'single_room';
 
 export type CameraMode = 'orbit' | 'walk';
 
+export type LightingPreset = 'daylight' | 'golden_hour' | 'night';
+
+export type RenderQuality = 'high' | 'fast';
+
 export type RoofStyle = 'flat' | 'gabled';
 
 export type FloorMaterialType = 'wood' | 'tile' | 'carpet' | 'concrete';
@@ -17,10 +21,42 @@ export type FurnitureType =
   | 'counter'
   | 'toilet'
   | 'sink'
+  | 'bathtub'
   | 'plant'
-  | 'tv_stand';
+  | 'tv_stand'
+  | 'rug'
+  | 'coffee_table'
+  | 'bookshelf'
+  | 'wardrobe'
+  | 'fridge'
+  | 'floor_lamp';
 
-export type FurnitureCategory = FurnitureType | 'custom';
+export type FurnitureInteractionKind =
+  | 'toggle_lamp'
+  | 'toggle_tv'
+  | 'toggle_door'
+  | 'sit';
+
+export interface HoveredFurnitureInfo {
+  index: number;
+  type: FurnitureType;
+  label: string;
+  actionLabel: string;
+  interactionKind: FurnitureInteractionKind;
+}
+
+export type FurnitureCategory =
+  | 'sofa'
+  | 'bed'
+  | 'table'
+  | 'chair'
+  | 'desk'
+  | 'counter'
+  | 'toilet'
+  | 'sink'
+  | 'plant'
+  | 'tv_stand'
+  | 'custom';
 
 export type FurniturePartShape = 'box' | 'cylinder' | 'sphere';
 

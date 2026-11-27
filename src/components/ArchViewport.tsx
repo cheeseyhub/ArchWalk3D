@@ -1,8 +1,18 @@
-import { useEffect, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { computeBlueprintBounds, getRoomCameraPose } from '../arch/blueprint';
+import {
+  classifyFurnitureItemDiff,
+  computeSeatCameraPose,
+  getFurnitureDisplayLabel,
+  getFurnitureInteractionDescriptor,
+} from '../arch/blueprintHistory';
 import { buildWallColliders, resolvePlayerCollision, type SolidWallCollider } from '../arch/collision';
 import { snapPlacementPosition } from '../arch/furnitureCatalog';
 import type {
@@ -10,10 +20,24 @@ import type {
   BlueprintFurniture,
   CameraMode,
   GeneratedFurnitureAsset,
+  HoveredFurnitureInfo,
+  LightingPreset,
+  RenderQuality,
   SpatialBlueprint,
 } from '../arch/types';
 import { buildArchitectureScene, disposeObject3D } from '../three/buildArchitecture';
-import { buildFurnitureGroup, buildFurniturePlacementGhost } from '../three/buildFurniture';
+import {
+  applyFurnitureColorInPlace,
+  applyFurniturePreviewScale,
+  applyFurnitureTransformInPlace,
+  buildFurnitureGroup,
+  buildFurniturePlacementGhost,
+  buildSelectionRing,
+  getFurnitureStableKey,
+  type InteractiveFurnitureController,
+} from '../three/buildFurniture';
+import { downloadArchitectureGltf } from '../three/exportGltf';
+import { computeTightShadowFrustum, getLightingPresetConfig } from '../three/lightingPresets';
 import { createProceduralTextureSet, type ProceduralTextureSet } from '../three/textures';
 
 export interface TeleportRequest {
@@ -21,19 +45,39 @@ export interface TeleportRequest {
   nonce: number;
 }
 
+export type FurniturePreviewPatch = Partial<
+  Pick<BlueprintFurniture, 'x' | 'z' | 'rotationY' | 'width' | 'depth' | 'height' | 'color'>
+>;
+
+export interface ArchViewportHandle {
+  exportGltf: () => Promise<string>;
+  getViewportSpawnCenter: () => { x: number; z: number };
+  previewFurnitureEdit: (index: number, patch: FurniturePreviewPatch) => void;
+}
+
 interface ArchViewportProps {
   blueprint: SpatialBlueprint;
   cameraMode: CameraMode;
   showRoof: boolean;
+  lightingPreset: LightingPreset;
+  renderQuality: RenderQuality;
   teleportRequest: TeleportRequest | null;
   resetNonce: number;
   placingAsset: GeneratedFurnitureAsset | null;
   placementRotationY: number;
+  arrangeMode: boolean;
+  selectedFurnitureIndex: number | null;
   onPlaceFurniture: (x: number, z: number, rotationY: number) => void;
   onRotatePlacement: () => void;
   onCancelPlacement: () => void;
   onPointerLockChange: (locked: boolean) => void;
   onActiveRoomChange: (roomId: string | null) => void;
+  onSelectFurniture: (index: number | null) => void;
+  onCommitMoveFurniture: (index: number, x: number, z: number) => void;
+  onHoveredInteractionChange: (info: HoveredFurnitureInfo | null) => void;
+  onSeatedChange: (seated: boolean) => void;
+  onRotateSelected: (deltaRadians: number) => void;
+  onDeleteSelected: () => void;
 }
 
 interface CameraFlight {
@@ -70,23 +114,39 @@ function detectSoftwareWebGL(): boolean {
   }
 }
 
-export function ArchViewport({
-  blueprint,
-  cameraMode,
-  showRoof,
-  teleportRequest,
-  resetNonce,
-  placingAsset,
-  placementRotationY,
-  onPlaceFurniture,
-  onRotatePlacement,
-  onCancelPlacement,
-  onPointerLockChange,
-  onActiveRoomChange,
-}: ArchViewportProps) {
+export const ArchViewport = forwardRef<ArchViewportHandle, ArchViewportProps>(function ArchViewport(
+  {
+    blueprint,
+    cameraMode,
+    showRoof,
+    lightingPreset,
+    renderQuality,
+    teleportRequest,
+    resetNonce,
+    placingAsset,
+    placementRotationY,
+    arrangeMode,
+    selectedFurnitureIndex,
+    onPlaceFurniture,
+    onRotatePlacement,
+    onCancelPlacement,
+    onPointerLockChange,
+    onActiveRoomChange,
+    onSelectFurniture,
+    onCommitMoveFurniture,
+    onHoveredInteractionChange,
+    onSeatedChange,
+    onRotateSelected,
+    onDeleteSelected,
+  },
+  ref,
+) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
   const [contextLost, setContextLost] = useState(false);
+  const [hoverCursor, setHoverCursor] = useState<'default' | 'pointer' | 'move'>('default');
+  const [isSeatedAttr, setIsSeatedAttr] = useState(false);
+  const sceneRebuildCountRef = useRef(0);
 
   // Store latest React props & callbacks in refs so the WebGL lifecycle mounts once
   const blueprintRef = useRef(blueprint);
@@ -95,10 +155,18 @@ export function ArchViewport({
   cameraModeRef.current = cameraMode;
   const showRoofRef = useRef(showRoof);
   showRoofRef.current = showRoof;
+  const lightingPresetRef = useRef(lightingPreset);
+  lightingPresetRef.current = lightingPreset;
+  const renderQualityRef = useRef(renderQuality);
+  renderQualityRef.current = renderQuality;
   const placingAssetRef = useRef(placingAsset);
   placingAssetRef.current = placingAsset;
   const placementRotationRef = useRef(placementRotationY);
   placementRotationRef.current = placementRotationY;
+  const arrangeModeRef = useRef(arrangeMode);
+  arrangeModeRef.current = arrangeMode;
+  const selectedFurnitureIndexRef = useRef(selectedFurnitureIndex);
+  selectedFurnitureIndexRef.current = selectedFurnitureIndex;
   const onPlaceFurnitureRef = useRef(onPlaceFurniture);
   onPlaceFurnitureRef.current = onPlaceFurniture;
   const onRotatePlacementRef = useRef(onRotatePlacement);
@@ -109,6 +177,18 @@ export function ArchViewport({
   onPointerLockRef.current = onPointerLockChange;
   const onActiveRoomRef = useRef(onActiveRoomChange);
   onActiveRoomRef.current = onActiveRoomChange;
+  const onSelectFurnitureRef = useRef(onSelectFurniture);
+  onSelectFurnitureRef.current = onSelectFurniture;
+  const onCommitMoveFurnitureRef = useRef(onCommitMoveFurniture);
+  onCommitMoveFurnitureRef.current = onCommitMoveFurniture;
+  const onHoveredInteractionRef = useRef(onHoveredInteractionChange);
+  onHoveredInteractionRef.current = onHoveredInteractionChange;
+  const onSeatedChangeRef = useRef(onSeatedChange);
+  onSeatedChangeRef.current = onSeatedChange;
+  const onRotateSelectedRef = useRef(onRotateSelected);
+  onRotateSelectedRef.current = onRotateSelected;
+  const onDeleteSelectedRef = useRef(onDeleteSelected);
+  onDeleteSelectedRef.current = onDeleteSelected;
 
   // Engine internals ref
   const engineRef = useRef<{
@@ -122,6 +202,15 @@ export function ArchViewport({
     archGroup: THREE.Group | null;
     roofGroup: THREE.Group | null;
     furnitureGroup: THREE.Group | null;
+    furnitureItems: BlueprintFurniture[];
+    furnitureRaycastTargets: THREE.Object3D[];
+    interactiveRaycastTargets: THREE.Object3D[];
+    interactiveControllers: InteractiveFurnitureController[];
+    interactiveStates: Map<string, boolean>;
+    selectionRing: THREE.Group | null;
+    selectionRingBaseSize: { width: number; depth: number };
+    interiorLights: THREE.PointLight[];
+    downlightMaterial: THREE.MeshStandardMaterial | null;
     ghostGroup: THREE.Group | null;
     bounds: BlueprintBounds;
     lastHoverPos: { x: number; z: number } | null;
@@ -129,15 +218,23 @@ export function ArchViewport({
     flight: CameraFlight;
     yaw: number;
     pitch: number;
+    isSeated: boolean;
+    standPosition: THREE.Vector3;
     requestRender: () => void;
+    markShadowsDirty: () => void;
     rebuildBlueprint: (bp: SpatialBlueprint, snapCamera: boolean) => void;
-    rebuildFurnitureOnly: (items: BlueprintFurniture[]) => void;
+    syncFurnitureInPlace: (items: BlueprintFurniture[]) => void;
+    previewFurnitureEdit: (index: number, patch: FurniturePreviewPatch) => void;
     syncPlacementGhost: (asset: GeneratedFurnitureAsset | null, rotY: number) => void;
     syncGhostRotation: (rotY: number) => void;
+    syncSelectionRing: (enabled: boolean, index: number | null, items: BlueprintFurniture[]) => void;
     flyToDollhouse: (bp: SpatialBlueprint, immediate?: boolean) => void;
     flyToRoom: (roomId: string, bp: SpatialBlueprint) => void;
     applyRoofVisibility: (visible: boolean) => void;
+    applyLightingPreset: (preset: LightingPreset) => void;
+    applyRenderQuality: (quality: RenderQuality) => void;
     syncMode: (mode: CameraMode) => void;
+    clearHoverState: () => void;
   } | null>(null);
 
   // Mount Three.js renderer, scene, lights, and input handlers ONCE
@@ -150,10 +247,12 @@ export function ArchViewport({
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
 
+    const initialLighting = getLightingPresetConfig(lightingPresetRef.current);
+    const initialHighQuality = renderQualityRef.current === 'high' && !isSoftwareGl;
+
     const scene = new THREE.Scene();
-    const bgHex = 0x12151c;
-    scene.background = new THREE.Color(bgHex);
-    scene.fog = new THREE.FogExp2(bgHex, 0.017);
+    scene.background = new THREE.Color(initialLighting.backgroundHex);
+    scene.fog = new THREE.FogExp2(initialLighting.fogHex, initialLighting.fogDensity);
 
     const camera = new THREE.PerspectiveCamera(48, width / height, 0.08, 180);
     camera.position.set(13, 11.5, 13);
@@ -164,46 +263,116 @@ export function ArchViewport({
     });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.08;
-    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    renderer.toneMappingExposure = initialLighting.toneMappingExposure;
+    // Cap pixel ratio at 1.5x on GPUs (1.0x on software WebGL) for locked 60 FPS
+    const getCappedPixelRatio = () => (isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 1.5));
+    const targetPixelRatio = getCappedPixelRatio();
+    renderer.setPixelRatio(targetPixelRatio);
     renderer.setSize(width, height);
+    // On-demand shadow map updates: zero per-frame shadow re-rendering while camera orbits/walks
     renderer.shadowMap.enabled = !isSoftwareGl;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.autoUpdate = false;
+    renderer.shadowMap.needsUpdate = !isSoftwareGl;
 
     renderer.domElement.style.display = 'block';
     renderer.domElement.style.width = '100%';
     renderer.domElement.style.height = '100%';
     mount.appendChild(renderer.domElement);
 
-    // Studio IBL reflections via RoomEnvironment on all devices
+    const markShadowsDirty = () => {
+      if (renderer.shadowMap.enabled) {
+        renderer.shadowMap.needsUpdate = true;
+      }
+    };
+
+    // Studio IBL reflections & indirect bounce light via PMREMGenerator + RoomEnvironment
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
-    const envTarget = pmremGenerator.fromScene(new RoomEnvironment(), 0.04);
+    const roomEnv = new RoomEnvironment();
+    const envTarget = pmremGenerator.fromScene(roomEnv, 0.04);
+    roomEnv.dispose();
     scene.environment = envTarget.texture;
+    scene.environmentIntensity = initialLighting.environmentIntensity;
     pmremGenerator.dispose();
 
-    // Balanced 3-point warm/cool architectural lighting rig
-    const hemiLight = new THREE.HemisphereLight(0xcfe0f5, 0x3b332b, 0.92);
+    // Balanced 3-point warm/cool architectural lighting rig (ONLY primary sunlight casts shadows)
+    const hemiLight = new THREE.HemisphereLight(
+      initialLighting.hemiSkyHex,
+      initialLighting.hemiGroundHex,
+      initialLighting.hemiIntensity,
+    );
     hemiLight.position.set(0, 30, 0);
     scene.add(hemiLight);
 
-    const keyLight = new THREE.DirectionalLight(0xfff1dc, 1.95);
-    keyLight.position.set(14, 22, 12);
+    const keyLight = new THREE.DirectionalLight(
+      initialLighting.sunColorHex,
+      initialLighting.sunIntensity,
+    );
+    keyLight.position.set(...initialLighting.sunPosition);
     keyLight.castShadow = !isSoftwareGl;
     keyLight.shadow.mapSize.set(1024, 1024);
-    keyLight.shadow.camera.near = 2;
-    keyLight.shadow.camera.far = 60;
-    const shadowD = 14;
-    keyLight.shadow.camera.left = -shadowD;
-    keyLight.shadow.camera.right = shadowD;
-    keyLight.shadow.camera.top = shadowD;
-    keyLight.shadow.camera.bottom = -shadowD;
-    keyLight.shadow.bias = -0.0005;
+    keyLight.shadow.camera.near = 1.5;
+    keyLight.shadow.camera.far = 65;
+    const initialFrustum = computeTightShadowFrustum(computeBlueprintBounds(blueprintRef.current));
+    keyLight.shadow.camera.left = initialFrustum.left;
+    keyLight.shadow.camera.right = initialFrustum.right;
+    keyLight.shadow.camera.top = initialFrustum.top;
+    keyLight.shadow.camera.bottom = initialFrustum.bottom;
+    keyLight.shadow.bias = -0.00045;
     keyLight.shadow.normalBias = 0.025;
+    keyLight.shadow.radius = 2.0;
+    keyLight.target.position.set(initialFrustum.targetX, 0, initialFrustum.targetZ);
+    scene.add(keyLight.target);
     scene.add(keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0x9ec0e8, 0.55);
-    rimLight.position.set(-14, 10, -12);
+    const rimLight = new THREE.DirectionalLight(
+      initialLighting.rimColorHex,
+      initialLighting.rimIntensity,
+    );
+    rimLight.castShadow = false;
+    rimLight.position.set(...initialLighting.rimPosition);
     scene.add(rimLight);
+
+    // Lazily initialized post-processing composer (GTAO ambient occlusion) ONLY when Quality: High is active
+    let composer: EffectComposer | null = null;
+    let gtaoPass: GTAOPass | null = null;
+    const ensureComposer = () => {
+      if (isSoftwareGl || composer) return;
+      const cw = Math.max(1, container.clientWidth);
+      const ch = Math.max(1, container.clientHeight);
+      const dpr = getCappedPixelRatio();
+      composer = new EffectComposer(renderer);
+      composer.setPixelRatio(dpr);
+      composer.setSize(cw, ch);
+
+      const renderPass = new RenderPass(scene, camera);
+      composer.addPass(renderPass);
+
+      gtaoPass = new GTAOPass(scene, camera, cw, ch);
+      gtaoPass.output = GTAOPass.OUTPUT.Default;
+      gtaoPass.blendIntensity = 0.62;
+      gtaoPass.updateGtaoMaterial({
+        radius: 0.42,
+        distanceExponent: 1.5,
+        thickness: 1.0,
+        scale: 1.05,
+        samples: 12,
+      });
+      gtaoPass.updatePdMaterial({
+        lumaPhi: 10,
+        depthPhi: 2,
+        normalPhi: 3,
+        radius: 6,
+        samples: 12,
+      });
+      composer.addPass(gtaoPass);
+
+      const outputPass = new OutputPass();
+      composer.addPass(outputPass);
+    };
+    if (initialHighQuality) {
+      ensureComposer();
+    }
 
     // OrbitControls for Dollhouse inspection
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -216,20 +385,7 @@ export function ArchViewport({
 
     const maxAniso = renderer.capabilities.getMaxAnisotropy();
     const textures = createProceduralTextureSet(maxAniso);
-    const sharedTexturesSet = new Set<THREE.Texture>([
-      textures.woodMap,
-      textures.woodBump,
-      textures.tileMap,
-      textures.tileBump,
-      textures.carpetMap,
-      textures.carpetBump,
-      textures.concreteMap,
-      textures.concreteBump,
-      textures.plasterBump,
-      textures.roofBump,
-      textures.contactShadow,
-      textures.groundGrid,
-    ]);
+    const sharedTexturesSet = textures.allSharedTextures;
 
     // First-person input & frame pacing state
     const keysPressed = new Set<string>();
@@ -258,8 +414,24 @@ export function ArchViewport({
       }
     };
 
+    const hasActiveDoorAnimation = (): boolean => {
+      const eng = engineRef.current;
+      if (!eng) return false;
+      for (const ctrl of eng.interactiveControllers) {
+        if (!ctrl.doorPivots) continue;
+        for (const dp of ctrl.doorPivots) {
+          const targetY = ctrl.isActive ? dp.openY : dp.closedY;
+          if (Math.abs(dp.pivot.rotation.y - targetY) > 0.004) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
     const hasActiveMotion = (): boolean => {
       if (flight.active) return true;
+      if (hasActiveDoorAnimation()) return true;
       if (cameraModeRef.current === 'walk' && keysPressed.size > 0) return true;
       return false;
     };
@@ -288,9 +460,36 @@ export function ArchViewport({
       frameId = window.setTimeout(poll, 5);
     };
 
+    // Walk Mode center-screen hover probe callback (assigned after raycast helpers are initialized)
+    let updateWalkHoverIfNeeded: ((force?: boolean) => void) | null = null;
+
     const stepSimulation = (dt: number) => {
       const eng = engineRef.current;
       if (!eng) return;
+
+      // Smoothly animate hinged fridge & wardrobe doors toward target open/closed angle
+      const doorLambda = isSoftwareGl ? 16 : 9.5;
+      const doorAlpha = 1 - Math.exp(-doorLambda * dt);
+      let doorAnimated = false;
+      for (const ctrl of eng.interactiveControllers) {
+        if (!ctrl.doorPivots) continue;
+        for (const dp of ctrl.doorPivots) {
+          const targetY = ctrl.isActive ? dp.openY : dp.closedY;
+          const diff = targetY - dp.pivot.rotation.y;
+          if (Math.abs(diff) <= 0.004) {
+            if (dp.pivot.rotation.y !== targetY) {
+              dp.pivot.rotation.y = targetY;
+              doorAnimated = true;
+            }
+          } else {
+            dp.pivot.rotation.y += diff * doorAlpha;
+            doorAnimated = true;
+          }
+        }
+      }
+      if (doorAnimated) {
+        markShadowsDirty();
+      }
 
       if (flight.active) {
         const lambda = isSoftwareGl ? 14 : 7.5;
@@ -321,6 +520,9 @@ export function ArchViewport({
             syncYawPitchFromCamera();
           }
           flight.active = false;
+          if (cameraModeRef.current === 'walk') {
+            updateWalkHoverIfNeeded?.(true);
+          }
         }
         return;
       }
@@ -338,7 +540,7 @@ export function ArchViewport({
         if (keysPressed.has('KeyD') || keysPressed.has('ArrowRight')) moveX += 1;
         if (keysPressed.has('KeyA') || keysPressed.has('ArrowLeft')) moveX -= 1;
 
-        if (moveX !== 0 || moveZ !== 0) {
+        if ((moveX !== 0 || moveZ !== 0) && !eng.isSeated) {
           camera.getWorldDirection(_forward);
           _forward.y = 0;
           if (_forward.lengthSq() > 1e-5) _forward.normalize();
@@ -358,6 +560,8 @@ export function ArchViewport({
           camera.position.z = resolved.z;
           camera.position.y = 1.62;
         }
+
+        updateWalkHoverIfNeeded?.(false);
       } else {
         controls.update();
       }
@@ -377,7 +581,11 @@ export function ArchViewport({
         lastFrameTime = now;
 
         stepSimulation(dt);
-        renderer.render(scene, camera);
+        if (composer && renderQualityRef.current === 'high' && !isSoftwareGl) {
+          composer.render();
+        } else {
+          renderer.render(scene, camera);
+        }
 
         const done = () => {
           if (disposed) return;
@@ -432,9 +640,124 @@ export function ArchViewport({
       requestRender();
     };
 
+    const applyLightingPreset = (preset: LightingPreset) => {
+      const cfg = getLightingPresetConfig(preset);
+      scene.background = new THREE.Color(cfg.backgroundHex);
+      if (scene.fog instanceof THREE.FogExp2) {
+        scene.fog.color.setHex(cfg.fogHex);
+        scene.fog.density = cfg.fogDensity;
+      } else {
+        scene.fog = new THREE.FogExp2(cfg.fogHex, cfg.fogDensity);
+      }
+      renderer.toneMappingExposure = cfg.toneMappingExposure;
+      scene.environmentIntensity = cfg.environmentIntensity;
+
+      hemiLight.color.setHex(cfg.hemiSkyHex);
+      hemiLight.groundColor.setHex(cfg.hemiGroundHex);
+      hemiLight.intensity = cfg.hemiIntensity;
+
+      const eng = engineRef.current;
+      const cx = eng?.bounds.centerX ?? 0;
+      const cz = eng?.bounds.centerZ ?? 0;
+
+      keyLight.color.setHex(cfg.sunColorHex);
+      keyLight.intensity = cfg.sunIntensity;
+      keyLight.position.set(cx + cfg.sunPosition[0], cfg.sunPosition[1], cz + cfg.sunPosition[2]);
+      keyLight.target.position.set(cx, 0, cz);
+      keyLight.target.updateMatrixWorld();
+
+      rimLight.color.setHex(cfg.rimColorHex);
+      rimLight.intensity = cfg.rimIntensity;
+      rimLight.position.set(cx + cfg.rimPosition[0], cfg.rimPosition[1], cz + cfg.rimPosition[2]);
+
+      if (eng) {
+        for (const pt of eng.interiorLights) {
+          pt.color.setHex(cfg.interiorLightColorHex);
+          pt.intensity = cfg.interiorLightIntensity;
+        }
+        if (eng.downlightMaterial) {
+          eng.downlightMaterial.emissiveIntensity = cfg.downlightEmissiveIntensity;
+        }
+      }
+
+      markShadowsDirty();
+      requestRender();
+    };
+
+    const applyRenderQuality = (quality: RenderQuality) => {
+      const useHigh = quality === 'high' && !isSoftwareGl;
+      if (useHigh) {
+        ensureComposer();
+      }
+      if (gtaoPass) {
+        gtaoPass.enabled = useHigh;
+      }
+      markShadowsDirty();
+      requestRender();
+    };
+
+    const refreshFurnitureIndicesAndTargets = (furnitureGroup: THREE.Group | null) => {
+      const eng = engineRef.current;
+      if (!eng) return;
+      const controllers: InteractiveFurnitureController[] = [];
+      const allTargets: THREE.Object3D[] = [];
+      const interactiveTargets: THREE.Object3D[] = [];
+
+      if (furnitureGroup) {
+        for (let i = 0; i < furnitureGroup.children.length; i++) {
+          const child = furnitureGroup.children[i];
+          child.userData.furnitureIndex = i;
+          allTargets.push(child);
+          const ctrl = child.userData?.interactiveController as
+            | InteractiveFurnitureController
+            | undefined;
+          if (ctrl) {
+            controllers.push(ctrl);
+            interactiveTargets.push(child);
+          }
+        }
+      }
+
+      eng.interactiveControllers = controllers;
+      eng.furnitureRaycastTargets = allTargets;
+      eng.interactiveRaycastTargets = interactiveTargets;
+    };
+
+    const syncSelectionRing = (
+      enabled: boolean,
+      index: number | null,
+      items: BlueprintFurniture[],
+    ) => {
+      const eng = engineRef.current;
+      if (!eng) return;
+
+      if (eng.selectionRing) {
+        scene.remove(eng.selectionRing);
+        disposeObject3D(eng.selectionRing, sharedTexturesSet);
+        eng.selectionRing = null;
+      }
+
+      if (enabled && index !== null && index >= 0 && index < items.length) {
+        const item = items[index];
+        const ring = buildSelectionRing(item.width, item.depth);
+        ring.position.set(item.x, 0.014, item.z);
+        ring.rotation.y = item.rotationY;
+        scene.add(ring);
+        eng.selectionRing = ring;
+        eng.selectionRingBaseSize = { width: item.width, depth: item.depth };
+      }
+
+      requestRender();
+    };
+
     const rebuildBlueprint = (bp: SpatialBlueprint, snapCamera: boolean) => {
       const eng = engineRef.current;
       if (!eng) return;
+
+      sceneRebuildCountRef.current += 1;
+      if (containerRef.current) {
+        containerRef.current.dataset.sceneRebuilds = String(sceneRebuildCountRef.current);
+      }
 
       if (eng.archGroup) {
         scene.remove(eng.archGroup);
@@ -442,28 +765,51 @@ export function ArchViewport({
         eng.archGroup = null;
         eng.roofGroup = null;
         eng.furnitureGroup = null;
+        eng.furnitureItems = [];
+        eng.furnitureRaycastTargets = [];
+        eng.interactiveRaycastTargets = [];
+        eng.interactiveControllers = [];
+        eng.interiorLights = [];
+        eng.downlightMaterial = null;
       }
 
-      const built = buildArchitectureScene(bp, textures, isSoftwareGl);
+      const built = buildArchitectureScene(bp, textures, isSoftwareGl, eng.interactiveStates);
       built.roofGroup.visible = showRoofRef.current;
       scene.add(built.rootGroup);
       eng.archGroup = built.rootGroup;
       eng.roofGroup = built.roofGroup;
       eng.furnitureGroup = built.furnitureGroup;
+      eng.furnitureItems = bp.furniture.slice();
+      refreshFurnitureIndicesAndTargets(built.furnitureGroup);
+      eng.interiorLights = built.interiorLights;
+      eng.downlightMaterial = built.downlightMaterial;
       eng.bounds = built.bounds;
       eng.colliders = buildWallColliders(bp.walls);
 
-      // Update key light shadow frustum tightly around blueprint bounds
-      const d = Math.max(10, Math.max(built.bounds.width, built.bounds.depth) * 0.85);
-      keyLight.shadow.camera.left = -d;
-      keyLight.shadow.camera.right = d;
-      keyLight.shadow.camera.top = d;
-      keyLight.shadow.camera.bottom = -d;
+      const showRing =
+        cameraModeRef.current === 'orbit' &&
+        !placingAssetRef.current &&
+        selectedFurnitureIndexRef.current !== null;
+      syncSelectionRing(showRing, selectedFurnitureIndexRef.current, bp.furniture);
+
+      // Fit primary directional light's 1024x1024 shadow frustum tightly to building bounds
+      const frustum = computeTightShadowFrustum(built.bounds);
+      keyLight.shadow.camera.left = frustum.left;
+      keyLight.shadow.camera.right = frustum.right;
+      keyLight.shadow.camera.top = frustum.top;
+      keyLight.shadow.camera.bottom = frustum.bottom;
+      keyLight.shadow.camera.near = frustum.near;
+      keyLight.shadow.camera.far = frustum.far;
       keyLight.shadow.camera.updateProjectionMatrix();
+
+      // Sync active lighting preset intensities & sun offset onto freshly built house
+      applyLightingPreset(lightingPresetRef.current);
 
       if (!isSoftwareGl) {
         renderer.compile(scene, camera);
       }
+
+      markShadowsDirty();
 
       if (cameraModeRef.current === 'orbit') {
         flyToDollhouse(bp, snapCamera);
@@ -473,22 +819,198 @@ export function ArchViewport({
       }
     };
 
-    const rebuildFurnitureOnly = (items: BlueprintFurniture[]) => {
+    /**
+     * Reconciles furniture changes IN-PLACE without rebuilding walls, floors, roof,
+     * or unchanged furniture items. Position/rotation/color mutate the existing Three.js
+     * Group directly; only dimension-changed or added items build a single Group.
+     */
+    const syncFurnitureInPlace = (nextItems: BlueprintFurniture[]) => {
       const eng = engineRef.current;
       if (!eng || !eng.archGroup) return;
 
-      if (eng.furnitureGroup) {
-        eng.archGroup.remove(eng.furnitureGroup);
-        disposeObject3D(eng.furnitureGroup, sharedTexturesSet);
+      if (!eng.furnitureGroup) {
+        const freshGroup = new THREE.Group();
+        freshGroup.name = 'furniture-root-group';
+        eng.archGroup.add(freshGroup);
+        eng.furnitureGroup = freshGroup;
       }
 
-      const nextGroup = new THREE.Group();
-      nextGroup.name = 'furniture-root-group';
-      for (const item of items) {
-        nextGroup.add(buildFurnitureGroup(item, textures));
+      const fGroup = eng.furnitureGroup;
+      const prevItems = eng.furnitureItems;
+      let shadowsNeedUpdate = false;
+
+      // Fast path: identical count (covers move, rotate, resize, recolor, and undo/redo of those)
+      if (prevItems.length === nextItems.length && fGroup.children.length === nextItems.length) {
+        for (let i = 0; i < nextItems.length; i++) {
+          const prev = prevItems[i];
+          const next = nextItems[i];
+          const existing = fGroup.children[i] as THREE.Group | undefined;
+          if (!existing) continue;
+
+          const diff = classifyFurnitureItemDiff(prev, next);
+          if (diff === 'none') {
+            if (existing.scale.x !== 1 || existing.scale.y !== 1 || existing.scale.z !== 1) {
+              existing.scale.set(1, 1, 1);
+              shadowsNeedUpdate = true;
+            }
+            continue;
+          }
+
+          if (diff === 'transform' || diff === 'transform_and_color') {
+            applyFurnitureTransformInPlace(existing, next.x, next.z, next.rotationY);
+            existing.scale.set(1, 1, 1);
+            shadowsNeedUpdate = true;
+            if (diff === 'transform') continue;
+          }
+
+          if (diff === 'color' || diff === 'transform_and_color') {
+            if (applyFurnitureColorInPlace(existing, next.color)) {
+              existing.scale.set(1, 1, 1);
+              continue;
+            }
+          }
+
+          // Only this 1 furniture item changed dimensions/type/customParts -> replace just this 1 child
+          const key = getFurnitureStableKey(next, i);
+          const rebuilt = buildFurnitureGroup(next, textures, {
+            index: i,
+            initialActive: eng.interactiveStates.get(key),
+          });
+          fGroup.remove(existing);
+          disposeObject3D(existing, sharedTexturesSet);
+          fGroup.add(rebuilt);
+          // Restore exact index slot in children array so indices match blueprint.furniture
+          const addedAt = fGroup.children.length - 1;
+          if (addedAt !== i) {
+            fGroup.children.splice(addedAt, 1);
+            fGroup.children.splice(i, 0, rebuilt);
+          }
+          shadowsNeedUpdate = true;
+        }
+      } else {
+        // Reconcile additions/deletions while reusing surviving unchanged Groups by stable key
+        const poolByKey = new Map<string, { group: THREE.Group; item: BlueprintFurniture }>();
+        for (let i = 0; i < fGroup.children.length; i++) {
+          const child = fGroup.children[i] as THREE.Group;
+          const prevItem = prevItems[i];
+          const key = String(child.userData.furnitureKey ?? '');
+          if (key && prevItem && !poolByKey.has(key)) {
+            poolByKey.set(key, { group: child, item: prevItem });
+          }
+        }
+
+        const orderedGroups: THREE.Group[] = [];
+        const reusedSet = new Set<THREE.Group>();
+
+        for (let i = 0; i < nextItems.length; i++) {
+          const next = nextItems[i];
+          const key = getFurnitureStableKey(next, i);
+          const pooled = poolByKey.get(key);
+          if (pooled && !reusedSet.has(pooled.group)) {
+            const diff = classifyFurnitureItemDiff(pooled.item, next);
+            if (diff !== 'rebuild_item') {
+              reusedSet.add(pooled.group);
+              if (diff === 'transform' || diff === 'transform_and_color') {
+                applyFurnitureTransformInPlace(pooled.group, next.x, next.z, next.rotationY);
+              }
+              if (diff === 'color' || diff === 'transform_and_color') {
+                if (!applyFurnitureColorInPlace(pooled.group, next.color)) {
+                  reusedSet.delete(pooled.group);
+                }
+              }
+              if (reusedSet.has(pooled.group)) {
+                pooled.group.scale.set(1, 1, 1);
+                orderedGroups.push(pooled.group);
+                continue;
+              }
+            }
+          }
+
+          orderedGroups.push(
+            buildFurnitureGroup(next, textures, {
+              index: i,
+              initialActive: eng.interactiveStates.get(key),
+            }),
+          );
+        }
+
+        // Dispose only removed/replaced groups
+        const currentChildren = fGroup.children.slice();
+        for (const oldChild of currentChildren) {
+          fGroup.remove(oldChild);
+          if (!reusedSet.has(oldChild as THREE.Group)) {
+            disposeObject3D(oldChild, sharedTexturesSet);
+          }
+        }
+        for (const nextChild of orderedGroups) {
+          fGroup.add(nextChild);
+        }
+        shadowsNeedUpdate = true;
       }
-      eng.archGroup.add(nextGroup);
-      eng.furnitureGroup = nextGroup;
+
+      eng.furnitureItems = nextItems.slice();
+      refreshFurnitureIndicesAndTargets(fGroup);
+
+      const showRing =
+        cameraModeRef.current === 'orbit' &&
+        !placingAssetRef.current &&
+        selectedFurnitureIndexRef.current !== null;
+      syncSelectionRing(showRing, selectedFurnitureIndexRef.current, nextItems);
+
+      if (shadowsNeedUpdate) {
+        markShadowsDirty();
+      }
+      requestRender();
+    };
+
+    const previewFurnitureEdit = (index: number, patch: FurniturePreviewPatch) => {
+      const eng = engineRef.current;
+      if (!eng || !eng.furnitureGroup) return;
+      const group = eng.furnitureGroup.children[index] as THREE.Group | undefined;
+      const item = blueprintRef.current.furniture[index];
+      if (!group || !item) return;
+
+      let shadowDirty = false;
+      const nextX = patch.x ?? group.position.x;
+      const nextZ = patch.z ?? group.position.z;
+      const nextRot = patch.rotationY ?? group.rotation.y;
+
+      if (patch.x !== undefined || patch.z !== undefined || patch.rotationY !== undefined) {
+        applyFurnitureTransformInPlace(group, nextX, nextZ, nextRot);
+        if (eng.selectionRing && selectedFurnitureIndexRef.current === index) {
+          eng.selectionRing.position.set(nextX, 0.014, nextZ);
+          eng.selectionRing.rotation.y = nextRot;
+        }
+        shadowDirty = true;
+      }
+
+      if (
+        patch.width !== undefined ||
+        patch.depth !== undefined ||
+        patch.height !== undefined
+      ) {
+        const nextW = patch.width ?? item.width;
+        const nextD = patch.depth ?? item.depth;
+        const nextH = patch.height ?? item.height;
+        applyFurniturePreviewScale(group, nextW, nextD, nextH);
+        if (eng.selectionRing && selectedFurnitureIndexRef.current === index) {
+          const baseRing = eng.selectionRingBaseSize;
+          eng.selectionRing.scale.set(
+            Math.max(0.2, nextW / Math.max(0.1, baseRing.width)),
+            1,
+            Math.max(0.2, nextD / Math.max(0.1, baseRing.depth)),
+          );
+        }
+        shadowDirty = true;
+      }
+
+      if (patch.color !== undefined) {
+        applyFurnitureColorInPlace(group, patch.color);
+      }
+
+      if (shadowDirty) {
+        markShadowsDirty();
+      }
       requestRender();
     };
 
@@ -526,10 +1048,34 @@ export function ArchViewport({
       const eng = engineRef.current;
       if (!eng || !eng.roofGroup) return;
       eng.roofGroup.visible = visible;
+      markShadowsDirty();
       requestRender();
     };
 
+    let lastHoveredKey = '';
+    const emitHoveredInteraction = (info: HoveredFurnitureInfo | null) => {
+      const nextKey = info
+        ? `${info.index}:${info.interactionKind}:${info.actionLabel}`
+        : '';
+      if (nextKey === lastHoveredKey) return;
+      lastHoveredKey = nextKey;
+      onHoveredInteractionRef.current?.(info);
+    };
+
+    const clearHoverState = () => {
+      emitHoveredInteraction(null);
+      setHoverCursor('default');
+    };
+
     const syncMode = (mode: CameraMode) => {
+      const eng = engineRef.current;
+      clearHoverState();
+      if (eng && eng.isSeated) {
+        eng.isSeated = false;
+        setIsSeatedAttr(false);
+        onSeatedChangeRef.current(false);
+      }
+
       if (mode === 'orbit') {
         if (document.pointerLockElement === renderer.domElement) {
           document.exitPointerLock?.();
@@ -562,6 +1108,15 @@ export function ArchViewport({
       archGroup: null,
       roofGroup: null,
       furnitureGroup: null,
+      furnitureItems: [],
+      furnitureRaycastTargets: [],
+      interactiveRaycastTargets: [],
+      interactiveControllers: [],
+      interactiveStates: new Map<string, boolean>(),
+      selectionRing: null,
+      selectionRingBaseSize: { width: 1, depth: 1 },
+      interiorLights: [],
+      downlightMaterial: null,
       ghostGroup: null,
       bounds: computeBlueprintBounds(blueprintRef.current),
       lastHoverPos: null,
@@ -569,15 +1124,23 @@ export function ArchViewport({
       flight,
       yaw: 0,
       pitch: 0,
+      isSeated: false,
+      standPosition: new THREE.Vector3(0, 1.62, 0),
       requestRender,
+      markShadowsDirty,
       rebuildBlueprint,
-      rebuildFurnitureOnly,
+      syncFurnitureInPlace,
+      previewFurnitureEdit,
       syncPlacementGhost,
       syncGhostRotation,
+      syncSelectionRing,
       flyToDollhouse,
       flyToRoom,
       applyRoofVisibility,
+      applyLightingPreset,
+      applyRenderQuality,
       syncMode,
+      clearHoverState,
     };
 
     // Initial blueprint build
@@ -595,15 +1158,51 @@ export function ArchViewport({
     controls.addEventListener('start', onOrbitStart);
     controls.addEventListener('change', onOrbitChange);
 
-    // Interactive floor raycast helper for furniture placement
+    // Interactive floor & furniture raycast helpers
     let downClientX = 0;
     let downClientY = 0;
     let downButton = -1;
     let lastGhostRaycastMs = 0;
+    let lastHoverRaycastMs = 0;
+    let lastWalkHoverMs = 0;
 
-    const raycastFloorPoint = (clientX: number, clientY: number): { x: number; z: number } | null => {
-      const eng = engineRef.current;
-      if (!eng) return null;
+    // Arrange Mode drag-to-move state
+    let draggingFurnitureIndex: number | null = null;
+    let dragOffsetX = 0;
+    let dragOffsetZ = 0;
+    let dragStartX = 0;
+    let dragStartZ = 0;
+    let dragCurrentX = 0;
+    let dragCurrentZ = 0;
+    let dragMoved = false;
+
+    const isVisibleInHierarchy = (obj: THREE.Object3D | null): boolean => {
+      let cur = obj;
+      while (cur) {
+        if (!cur.visible) return false;
+        cur = cur.parent;
+      }
+      return true;
+    };
+
+    const findFurnitureRoot = (
+      obj: THREE.Object3D | null,
+      furnitureGroup: THREE.Group,
+    ): THREE.Group | null => {
+      let cur: THREE.Object3D | null = obj;
+      while (cur && cur !== furnitureGroup) {
+        if (cur.parent === furnitureGroup && typeof cur.userData?.furnitureIndex === 'number') {
+          return cur as THREE.Group;
+        }
+        cur = cur.parent;
+      }
+      return null;
+    };
+
+    const raycastFloorPointRaw = (
+      clientX: number,
+      clientY: number,
+    ): { x: number; z: number } | null => {
       const rect = renderer.domElement.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return null;
       _pointerNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
@@ -611,12 +1210,176 @@ export function ArchViewport({
       _raycaster.setFromCamera(_pointerNdc, camera);
       const hit = _raycaster.ray.intersectPlane(_floorPlane, _hitPoint);
       if (!hit) return null;
-      return snapPlacementPosition(hit.x, hit.z, eng.bounds, 0.1);
+      return { x: hit.x, z: hit.z };
+    };
+
+    const raycastFloorPoint = (clientX: number, clientY: number): { x: number; z: number } | null => {
+      const eng = engineRef.current;
+      if (!eng) return null;
+      const raw = raycastFloorPointRaw(clientX, clientY);
+      if (!raw) return null;
+      return snapPlacementPosition(raw.x, raw.z, eng.bounds, 0.1);
+    };
+
+    const raycastFurnitureAtNdc = (
+      ndcX: number,
+      ndcY: number,
+      maxDistance: number,
+      interactiveOnly = false,
+    ): {
+      group: THREE.Group;
+      index: number;
+      controller: InteractiveFurnitureController | null;
+      distance: number;
+    } | null => {
+      const eng = engineRef.current;
+      if (!eng || !eng.furnitureGroup) return null;
+
+      // Targeted raycasting ONLY against dedicated furniture/interactive target arrays (never scene.children)
+      const targets = interactiveOnly
+        ? eng.interactiveRaycastTargets
+        : eng.furnitureRaycastTargets;
+      if (targets.length === 0) return null;
+
+      _pointerNdc.set(ndcX, ndcY);
+      _raycaster.setFromCamera(_pointerNdc, camera);
+      _raycaster.near = 0.05;
+      _raycaster.far = maxDistance;
+
+      const hits = _raycaster.intersectObjects(targets, true);
+      for (const hit of hits) {
+        if (!isVisibleInHierarchy(hit.object)) continue;
+        // Skip transparent floor contact-shadow discs so clicks/hovers feel exact
+        if (hit.object instanceof THREE.Mesh) {
+          const mat = hit.object.material;
+          if (!Array.isArray(mat) && mat instanceof THREE.MeshBasicMaterial && mat.depthWrite === false) {
+            continue;
+          }
+        }
+        const fRoot = findFurnitureRoot(hit.object, eng.furnitureGroup);
+        if (!fRoot) continue;
+        const idx = fRoot.userData.furnitureIndex as number;
+        const controller =
+          (fRoot.userData.interactiveController as InteractiveFurnitureController | undefined) ?? null;
+        return {
+          group: fRoot,
+          index: idx,
+          controller,
+          distance: hit.distance,
+        };
+      }
+      return null;
+    };
+
+    const buildHoverInfo = (
+      index: number,
+      controller: InteractiveFurnitureController | null,
+      mode: CameraMode,
+    ): HoveredFurnitureInfo | null => {
+      if (!controller) return null;
+      const item = blueprintRef.current.furniture[index];
+      if (!item) return null;
+      const desc = getFurnitureInteractionDescriptor(item.type, mode, controller.isActive);
+      if (!desc) return null;
+      return {
+        index,
+        type: item.type,
+        label: getFurnitureDisplayLabel(item),
+        actionLabel: desc.actionLabel,
+        interactionKind: desc.interactionKind,
+      };
+    };
+
+    const triggerFurnitureInteraction = (
+      index: number,
+      controller: InteractiveFurnitureController,
+    ) => {
+      const eng = engineRef.current;
+      if (!eng) return;
+      const item = blueprintRef.current.furniture[index];
+      if (!item) return;
+
+      if (controller.kind === 'sit') {
+        if (cameraModeRef.current !== 'walk') return;
+        const pose = computeSeatCameraPose(item);
+        eng.standPosition.set(pose.standPosition[0], pose.standPosition[1], pose.standPosition[2]);
+        eng.isSeated = true;
+        setIsSeatedAttr(true);
+        onSeatedChangeRef.current(true);
+        flight.targetPos.set(pose.position[0], pose.position[1], pose.position[2]);
+        flight.targetLook.set(pose.lookAt[0], pose.lookAt[1], pose.lookAt[2]);
+        flight.endMode = 'walk';
+        flight.active = true;
+        emitHoveredInteraction(null);
+        requestRender();
+        return;
+      }
+
+      const nextActive = !controller.isActive;
+      controller.setActive(nextActive);
+      eng.interactiveStates.set(controller.key, nextActive);
+      requestRender();
+
+      // Immediately refresh hovered prompt text so "Turn On" flips to "Turn Off" live
+      const refreshed = buildHoverInfo(index, controller, cameraModeRef.current);
+      emitHoveredInteraction(refreshed);
+    };
+
+    const standUpIfSeated = () => {
+      const eng = engineRef.current;
+      if (!eng || !eng.isSeated) return;
+      eng.isSeated = false;
+      setIsSeatedAttr(false);
+      onSeatedChangeRef.current(false);
+
+      const resolved = resolvePlayerCollision(
+        eng.standPosition.x,
+        eng.standPosition.z,
+        0.28,
+        eng.colliders,
+      );
+      camera.getWorldDirection(_forward);
+      _forward.y = 0;
+      if (_forward.lengthSq() < 1e-4) _forward.set(0, 0, -1);
+      else _forward.normalize();
+
+      flight.targetPos.set(resolved.x, 1.62, resolved.z);
+      flight.targetLook.set(resolved.x + _forward.x * 3, 1.58, resolved.z + _forward.z * 3);
+      flight.endMode = 'walk';
+      flight.active = true;
+      requestRender();
+    };
+
+    // Walk Mode center-screen hover probe (within 2.5m)
+    updateWalkHoverIfNeeded = (force = false) => {
+      if (
+        cameraModeRef.current !== 'walk' ||
+        placingAssetRef.current ||
+        arrangeModeRef.current
+      ) {
+        return;
+      }
+      const eng = engineRef.current;
+      if (!eng || eng.isSeated || flight.active) {
+        emitHoveredInteraction(null);
+        return;
+      }
+
+      const now = performance.now();
+      if (!force && now - lastWalkHoverMs < (isSoftwareGl ? 90 : 50)) return;
+      lastWalkHoverMs = now;
+
+      const hit = raycastFurnitureAtNdc(0, 0, 2.5, true);
+      if (hit && hit.controller) {
+        emitHoveredInteraction(buildHoverInfo(hit.index, hit.controller, 'walk'));
+      } else {
+        emitHoveredInteraction(null);
+      }
     };
 
     // Walk mode pointer lock + drag-to-look mouse fallback
     const onCanvasClick = () => {
-      if (placingAssetRef.current) return;
+      if (placingAssetRef.current || arrangeModeRef.current) return;
       if (cameraModeRef.current === 'walk' && document.pointerLockElement !== renderer.domElement) {
         try {
           const res = renderer.domElement.requestPointerLock?.() as unknown as Promise<void> | undefined;
@@ -636,12 +1399,102 @@ export function ArchViewport({
       onPointerLockRef.current(isPointerLocked);
     };
 
+    // Track recent Orbit single-click toggle so double-clicking an interactive item to edit it
+    // cleanly restores its prior on/off/open/closed state instead of leaving an accidental toggle.
+    let lastSingleClickToggle: {
+      index: number;
+      controller: InteractiveFurnitureController;
+      atMs: number;
+    } | null = null;
+
+    // Direct double-click furniture editing in Orbit Mode (no separate mode toggle required)
+    const onDoubleClickCanvas = (e: MouseEvent) => {
+      if (cameraModeRef.current !== 'orbit' || placingAssetRef.current) return;
+      const eng = engineRef.current;
+      if (!eng) return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+      const hit = raycastFurnitureAtNdc(ndcX, ndcY, 120, false);
+      if (!hit || hit.index < 0) return;
+
+      // Revert accidental single-click toggle if the user double-clicked a lamp/TV/fridge/wardrobe
+      if (
+        lastSingleClickToggle &&
+        lastSingleClickToggle.index === hit.index &&
+        performance.now() - lastSingleClickToggle.atMs < 420
+      ) {
+        const prevCtrl = lastSingleClickToggle.controller;
+        const restored = !prevCtrl.isActive;
+        prevCtrl.setActive(restored);
+        eng.interactiveStates.set(prevCtrl.key, restored);
+        lastSingleClickToggle = null;
+      }
+
+      clearHoverState();
+      onSelectFurnitureRef.current(hit.index);
+      syncSelectionRing(true, hit.index, blueprintRef.current.furniture);
+      markShadowsDirty();
+      requestRender();
+    };
+
+    // Capture-phase pointerdown so dragging selected furniture disables OrbitControls before OrbitControls starts
     const onPointerDown = (e: PointerEvent) => {
       downClientX = e.clientX;
       downClientY = e.clientY;
       downButton = e.button;
 
-      if (cameraModeRef.current !== 'walk' || placingAssetRef.current) return;
+      if (placingAssetRef.current) return;
+
+      // Orbit Mode floor-plane drag: active in Arrange Mode (any furniture) OR directly on a double-click selected item
+      if (
+        cameraModeRef.current === 'orbit' &&
+        e.button === 0 &&
+        (arrangeModeRef.current || selectedFurnitureIndexRef.current !== null)
+      ) {
+        const eng = engineRef.current;
+        if (!eng) return;
+        const rect = renderer.domElement.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        const hit = raycastFurnitureAtNdc(ndcX, ndcY, 120, false);
+        const canDragHit =
+          hit &&
+          hit.index >= 0 &&
+          (arrangeModeRef.current || hit.index === selectedFurnitureIndexRef.current);
+
+        if (canDragHit && hit) {
+          const item = blueprintRef.current.furniture[hit.index];
+          if (item) {
+            flight.active = false;
+            controls.enabled = false;
+            draggingFurnitureIndex = hit.index;
+            dragStartX = item.x;
+            dragStartZ = item.z;
+            dragCurrentX = item.x;
+            dragCurrentZ = item.z;
+            dragMoved = false;
+
+            const floorHit = raycastFloorPointRaw(e.clientX, e.clientY);
+            dragOffsetX = floorHit ? item.x - floorHit.x : 0;
+            dragOffsetZ = floorHit ? item.z - floorHit.z : 0;
+
+            if (arrangeModeRef.current) {
+              onSelectFurnitureRef.current(hit.index);
+              syncSelectionRing(true, hit.index, blueprintRef.current.furniture);
+            }
+            setHoverCursor('move');
+            return;
+          }
+        }
+      }
+
+      if (cameraModeRef.current !== 'walk') return;
       flight.active = false;
       isDraggingLook = true;
       lastPointerX = e.clientX;
@@ -651,13 +1504,33 @@ export function ArchViewport({
     const onPointerUp = (e: PointerEvent) => {
       isDraggingLook = false;
 
-      // Click-to-place furniture on crisp left-click without camera drag
-      if (
-        placingAssetRef.current &&
+      // Finish floor-plane drag and commit ONE Undo snapshot on release
+      if (draggingFurnitureIndex !== null) {
+        const committedIdx = draggingFurnitureIndex;
+        const finalX = dragCurrentX;
+        const finalZ = dragCurrentZ;
+        const movedEnough =
+          dragMoved && Math.hypot(finalX - dragStartX, finalZ - dragStartZ) > 0.005;
+
+        draggingFurnitureIndex = null;
+        dragMoved = false;
+        controls.enabled = cameraModeRef.current === 'orbit';
+        setHoverCursor('default');
+
+        if (movedEnough) {
+          onCommitMoveFurnitureRef.current(committedIdx, finalX, finalZ);
+        }
+        downButton = -1;
+        return;
+      }
+
+      const wasCrispClick =
         downButton === 0 &&
         e.target === renderer.domElement &&
-        Math.hypot(e.clientX - downClientX, e.clientY - downClientY) < 6
-      ) {
+        Math.hypot(e.clientX - downClientX, e.clientY - downClientY) < 6;
+
+      // Click-to-place custom furniture
+      if (placingAssetRef.current && wasCrispClick) {
         const pt = raycastFloorPoint(e.clientX, e.clientY);
         if (pt) {
           if (engineRef.current) {
@@ -668,24 +1541,138 @@ export function ArchViewport({
           }
           onPlaceFurnitureRef.current(pt.x, pt.z, placementRotationRef.current);
         }
+        downButton = -1;
+        return;
       }
+
+      // Clicking empty floor/background deselects active furniture (both Arrange Mode & direct double-click edit)
+      if (
+        cameraModeRef.current === 'orbit' &&
+        wasCrispClick &&
+        (arrangeModeRef.current || selectedFurnitureIndexRef.current !== null)
+      ) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+          const hit = raycastFurnitureAtNdc(ndcX, ndcY, 120, false);
+          if (!hit || (!arrangeModeRef.current && hit.index !== selectedFurnitureIndexRef.current)) {
+            onSelectFurnitureRef.current(null);
+          }
+        }
+        downButton = -1;
+        return;
+      }
+
+      // Orbit Mode (non-editing): crisp left-click toggles interactive furniture (lamp, TV, fridge, wardrobe)
+      if (
+        !arrangeModeRef.current &&
+        selectedFurnitureIndexRef.current === null &&
+        cameraModeRef.current === 'orbit' &&
+        wasCrispClick
+      ) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+          const hit = raycastFurnitureAtNdc(ndcX, ndcY, 120, true);
+          if (hit && hit.controller && hit.controller.kind !== 'sit') {
+            triggerFurnitureInteraction(hit.index, hit.controller);
+            lastSingleClickToggle = {
+              index: hit.index,
+              controller: hit.controller,
+              atMs: performance.now(),
+            };
+          }
+        }
+      }
+
       downButton = -1;
     };
 
     const onPointerMoveCanvas = (e: PointerEvent) => {
-      if (!placingAssetRef.current) return;
       const eng = engineRef.current;
-      if (!eng || !eng.ghostGroup) return;
+      if (!eng) return;
 
-      const now = performance.now();
-      if (isSoftwareGl && now - lastGhostRaycastMs < 45) return;
-      lastGhostRaycastMs = now;
+      // 1. Active floor-plane furniture drag (y = 0.01 locked, 60 FPS in-place transform)
+      if (draggingFurnitureIndex !== null) {
+        const floorHit = raycastFloorPointRaw(e.clientX, e.clientY);
+        if (floorHit) {
+          const snapped = snapPlacementPosition(
+            floorHit.x + dragOffsetX,
+            floorHit.z + dragOffsetZ,
+            eng.bounds,
+            0.05,
+          );
+          dragCurrentX = snapped.x;
+          dragCurrentZ = snapped.z;
+          dragMoved = true;
 
-      const pt = raycastFloorPoint(e.clientX, e.clientY);
-      if (pt) {
-        eng.lastHoverPos = pt;
-        eng.ghostGroup.position.set(pt.x, 0.01, pt.z);
-        requestRender();
+          const meshGroup = eng.furnitureGroup?.children[draggingFurnitureIndex];
+          if (meshGroup) {
+            meshGroup.position.set(snapped.x, 0.01, snapped.z);
+          }
+          if (eng.selectionRing) {
+            eng.selectionRing.position.set(snapped.x, 0.014, snapped.z);
+          }
+          markShadowsDirty();
+          requestRender();
+        }
+        return;
+      }
+
+      // 2. Custom furniture placement ghost tracking
+      if (placingAssetRef.current) {
+        if (!eng.ghostGroup) return;
+        const now = performance.now();
+        if (isSoftwareGl && now - lastGhostRaycastMs < 50) return;
+        lastGhostRaycastMs = now;
+
+        const pt = raycastFloorPoint(e.clientX, e.clientY);
+        if (pt) {
+          eng.lastHoverPos = pt;
+          eng.ghostGroup.position.set(pt.x, 0.01, pt.z);
+          requestRender();
+        }
+        return;
+      }
+
+      // 3. Orbit Mode hover feedback (throttled >= 50ms, targeted raycast only)
+      if (cameraModeRef.current === 'orbit') {
+        const now = performance.now();
+        if (now - lastHoverRaycastMs < (isSoftwareGl ? 90 : 50)) return;
+        lastHoverRaycastMs = now;
+
+        const rect = renderer.domElement.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        const isEditingSelected = selectedFurnitureIndexRef.current !== null;
+        if (arrangeModeRef.current) {
+          const hit = raycastFurnitureAtNdc(ndcX, ndcY, 120, false);
+          emitHoveredInteraction(null);
+          setHoverCursor(hit ? 'move' : 'default');
+        } else if (isEditingSelected) {
+          const hit = raycastFurnitureAtNdc(ndcX, ndcY, 120, false);
+          emitHoveredInteraction(null);
+          setHoverCursor(hit && hit.index === selectedFurnitureIndexRef.current ? 'move' : 'default');
+        } else {
+          const hit = raycastFurnitureAtNdc(ndcX, ndcY, 120, true);
+          if (hit && hit.controller && hit.controller.kind !== 'sit') {
+            emitHoveredInteraction(buildHoverInfo(hit.index, hit.controller, 'orbit'));
+            setHoverCursor('pointer');
+          } else {
+            emitHoveredInteraction(null);
+            setHoverCursor('default');
+          }
+        }
+      }
+    };
+
+    const onPointerLeaveCanvas = () => {
+      if (draggingFurnitureIndex === null && cameraModeRef.current === 'orbit') {
+        clearHoverState();
       }
     };
 
@@ -695,7 +1682,7 @@ export function ArchViewport({
       if (!eng) return;
 
       if (isPointerLocked) {
-        flight.active = false;
+        if (!eng.isSeated) flight.active = false;
         const sensitivity = 0.0022;
         eng.yaw -= e.movementX * sensitivity;
         eng.pitch = THREE.MathUtils.clamp(
@@ -720,7 +1707,7 @@ export function ArchViewport({
       }
     };
 
-    // Keyboard WASD / Arrows + Placement Rotate (R) / Cancel (ESC)
+    // Keyboard WASD / Arrows + Walk E Interact + Arrange R/Delete/Esc + Placement R/Esc
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (
@@ -745,6 +1732,51 @@ export function ArchViewport({
         }
       }
 
+      // Selected furniture keyboard shortcuts (works for BOTH direct double-click edit & Arrange Mode)
+      if (
+        cameraModeRef.current === 'orbit' &&
+        !placingAssetRef.current &&
+        selectedFurnitureIndexRef.current !== null
+      ) {
+        if (e.code === 'KeyR' && !e.metaKey && !e.ctrlKey) {
+          e.preventDefault();
+          onRotateSelectedRef.current(e.shiftKey ? -Math.PI / 4 : Math.PI / 4);
+          return;
+        }
+        if (e.code === 'Delete' || e.code === 'Backspace') {
+          e.preventDefault();
+          onDeleteSelectedRef.current();
+          return;
+        }
+        if (e.code === 'Escape') {
+          e.preventDefault();
+          onSelectFurnitureRef.current(null);
+          return;
+        }
+      }
+
+      // Walk Mode 'E' key interaction
+      if (
+        e.code === 'KeyE' &&
+        cameraModeRef.current === 'walk' &&
+        !placingAssetRef.current &&
+        !arrangeModeRef.current
+      ) {
+        const eng = engineRef.current;
+        if (!eng) return;
+        if (eng.isSeated) {
+          e.preventDefault();
+          standUpIfSeated();
+          return;
+        }
+        const hit = raycastFurnitureAtNdc(0, 0, 2.5, true);
+        if (hit && hit.controller) {
+          e.preventDefault();
+          triggerFurnitureInteraction(hit.index, hit.controller);
+          return;
+        }
+      }
+
       if (
         e.code === 'KeyW' ||
         e.code === 'KeyA' ||
@@ -756,6 +1788,11 @@ export function ArchViewport({
         e.code === 'ArrowRight'
       ) {
         if (cameraModeRef.current === 'walk') {
+          const eng = engineRef.current;
+          if (eng?.isSeated) {
+            standUpIfSeated();
+            return;
+          }
           flight.active = false;
           keysPressed.add(e.code);
           lastFrameTime = performance.now();
@@ -772,6 +1809,11 @@ export function ArchViewport({
       keysPressed.clear();
       isDraggingLook = false;
       downButton = -1;
+      if (draggingFurnitureIndex !== null) {
+        draggingFurnitureIndex = null;
+        dragMoved = false;
+        controls.enabled = cameraModeRef.current === 'orbit';
+      }
     };
 
     const onContextLost = (e: Event) => {
@@ -785,8 +1827,10 @@ export function ArchViewport({
     };
 
     renderer.domElement.addEventListener('click', onCanvasClick);
-    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    renderer.domElement.addEventListener('dblclick', onDoubleClickCanvas);
+    renderer.domElement.addEventListener('pointerdown', onPointerDown, true);
     renderer.domElement.addEventListener('pointermove', onPointerMoveCanvas);
+    renderer.domElement.addEventListener('pointerleave', onPointerLeaveCanvas);
     renderer.domElement.addEventListener('webglcontextlost', onContextLost);
     renderer.domElement.addEventListener('webglcontextrestored', onContextRestored);
     document.addEventListener('pointerlockchange', onPointerLockChangeDom);
@@ -796,16 +1840,22 @@ export function ArchViewport({
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', onBlur);
 
-    // ResizeObserver keeps canvas crisp when sidebar collapses/expands or window resizes
+    // ResizeObserver keeps canvas and post-processing targets crisp on layout changes
     let prevPortrait = width < height;
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const w = Math.max(1, Math.floor(entry.contentRect.width));
         const h = Math.max(1, Math.floor(entry.contentRect.height));
         const nextPortrait = w < h;
+        const dpr = getCappedPixelRatio();
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
+        renderer.setPixelRatio(dpr);
         renderer.setSize(w, h);
+        if (composer) {
+          composer.setPixelRatio(dpr);
+          composer.setSize(w, h);
+        }
         if (nextPortrait !== prevPortrait && cameraModeRef.current === 'orbit') {
           prevPortrait = nextPortrait;
           flyToDollhouse(blueprintRef.current, true);
@@ -826,8 +1876,10 @@ export function ArchViewport({
       controls.removeEventListener('change', onOrbitChange);
       controls.dispose();
       renderer.domElement.removeEventListener('click', onCanvasClick);
-      renderer.domElement.removeEventListener('pointerdown', onPointerDown);
+      renderer.domElement.removeEventListener('dblclick', onDoubleClickCanvas);
+      renderer.domElement.removeEventListener('pointerdown', onPointerDown, true);
       renderer.domElement.removeEventListener('pointermove', onPointerMoveCanvas);
+      renderer.domElement.removeEventListener('pointerleave', onPointerLeaveCanvas);
       renderer.domElement.removeEventListener('webglcontextlost', onContextLost);
       renderer.domElement.removeEventListener('webglcontextrestored', onContextRestored);
       document.removeEventListener('pointerlockchange', onPointerLockChangeDom);
@@ -837,12 +1889,17 @@ export function ArchViewport({
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', onBlur);
 
+      if (engineRef.current?.selectionRing) {
+        disposeObject3D(engineRef.current.selectionRing, sharedTexturesSet);
+      }
       if (engineRef.current?.ghostGroup) {
         disposeObject3D(engineRef.current.ghostGroup, sharedTexturesSet);
       }
       if (engineRef.current?.archGroup) {
         disposeObject3D(engineRef.current.archGroup, sharedTexturesSet);
       }
+      gtaoPass?.dispose();
+      composer?.dispose();
       textures.dispose();
       envTarget.dispose();
       renderer.dispose();
@@ -882,7 +1939,7 @@ export function ArchViewport({
     if (structureChanged) {
       engineRef.current?.rebuildBlueprint(blueprint, false);
     } else {
-      engineRef.current?.rebuildFurnitureOnly(blueprint.furniture);
+      engineRef.current?.syncFurnitureInPlace(blueprint.furniture);
     }
   }, [blueprint]);
 
@@ -901,6 +1958,16 @@ export function ArchViewport({
     engineRef.current?.applyRoofVisibility(showRoof);
   }, [showRoof]);
 
+  // Apply live lighting preset (Daylight, Golden Hour, Night)
+  useEffect(() => {
+    engineRef.current?.applyLightingPreset(lightingPreset);
+  }, [lightingPreset]);
+
+  // Toggle render quality (High: GTAO ambient occlusion vs Fast: direct WebGLRenderer)
+  useEffect(() => {
+    engineRef.current?.applyRenderQuality(renderQuality);
+  }, [renderQuality]);
+
   // Switch Orbit vs Walk mode
   const initialModeRef = useRef(true);
   useEffect(() => {
@@ -911,10 +1978,27 @@ export function ArchViewport({
     engineRef.current?.syncMode(cameraMode);
   }, [cameraMode]);
 
+  // Sync brass selection ring whenever an item is selected in Orbit Mode (via double-click or Arrange Mode)
+  useEffect(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+    const showRing = cameraMode === 'orbit' && !placingAsset && selectedFurnitureIndex !== null;
+    if (arrangeMode || showRing) {
+      eng.clearHoverState();
+    }
+    eng.syncSelectionRing(showRing, selectedFurnitureIndex, blueprintRef.current.furniture);
+  }, [cameraMode, placingAsset, arrangeMode, selectedFurnitureIndex, blueprint.furniture]);
+
   // Smoothly teleport inside a clicked room
   useEffect(() => {
     if (!teleportRequest) return;
-    engineRef.current?.flyToRoom(teleportRequest.roomId, blueprintRef.current);
+    const eng = engineRef.current;
+    if (eng?.isSeated) {
+      eng.isSeated = false;
+      setIsSeatedAttr(false);
+      onSeatedChangeRef.current(false);
+    }
+    eng?.flyToRoom(teleportRequest.roomId, blueprintRef.current);
   }, [teleportRequest]);
 
   // Reset View action
@@ -922,6 +2006,11 @@ export function ArchViewport({
     if (resetNonce === 0) return;
     const eng = engineRef.current;
     if (!eng) return;
+    if (eng.isSeated) {
+      eng.isSeated = false;
+      setIsSeatedAttr(false);
+      onSeatedChangeRef.current(false);
+    }
     if (cameraModeRef.current === 'orbit') {
       eng.flyToDollhouse(blueprintRef.current, false);
     } else {
@@ -930,26 +2019,61 @@ export function ArchViewport({
     }
   }, [resetNonce]);
 
+  useImperativeHandle(
+    ref,
+    () => ({
+      exportGltf: async () => {
+        const eng = engineRef.current;
+        if (!eng || !eng.archGroup) {
+          throw new Error('3D model is not ready for export yet.');
+        }
+        return downloadArchitectureGltf(eng.archGroup, blueprintRef.current.name);
+      },
+      getViewportSpawnCenter: () => {
+        const eng = engineRef.current;
+        if (!eng) {
+          const b = computeBlueprintBounds(blueprintRef.current);
+          return { x: Number(b.centerX.toFixed(2)), z: Number(b.centerZ.toFixed(2)) };
+        }
+        const target = eng.controls.target;
+        return snapPlacementPosition(target.x, target.z, eng.bounds, 0.1);
+      },
+      previewFurnitureEdit: (index: number, patch: FurniturePreviewPatch) => {
+        engineRef.current?.previewFurnitureEdit(index, patch);
+      },
+    }),
+    [],
+  );
+
+  const canvasCursorClass = placingAsset
+    ? 'cursor-crosshair'
+    : cameraMode === 'walk'
+      ? 'cursor-crosshair'
+      : hoverCursor === 'move'
+        ? 'cursor-move'
+        : hoverCursor === 'pointer'
+          ? 'cursor-pointer'
+          : 'cursor-grab active:cursor-grabbing';
+
   return (
     <div
       ref={containerRef}
       data-testid="arch-viewport"
       data-camera-mode={cameraMode}
       data-roof-visible={String(showRoof)}
+      data-lighting-preset={lightingPreset}
+      data-render-quality={renderQuality}
       data-placing={placingAsset ? placingAsset.name : ''}
+      data-arrange-mode={String(arrangeMode)}
+      data-selected-furniture={selectedFurnitureIndex !== null ? String(selectedFurnitureIndex) : ''}
+      data-seated={String(isSeatedAttr)}
       data-furniture-count={String(blueprint.furniture.length)}
       className="relative w-full h-full overflow-hidden bg-[#12151c]"
     >
       {/* Isolated mount node for Three.js WebGL canvas */}
       <div
         ref={canvasMountRef}
-        className={`w-full h-full ${
-          placingAsset
-            ? 'cursor-crosshair'
-            : cameraMode === 'walk'
-              ? 'cursor-crosshair'
-              : 'cursor-grab active:cursor-grabbing'
-        }`}
+        className={`w-full h-full ${canvasCursorClass}`}
       />
 
       {contextLost && (
@@ -966,4 +2090,4 @@ export function ArchViewport({
       )}
     </div>
   );
-}
+});

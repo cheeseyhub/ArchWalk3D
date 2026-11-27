@@ -22,10 +22,10 @@ test('prepareSavedBlueprintPayload clamps oversized strings, arrays, and compute
   }));
   const hugeWalls = Array.from({ length: 140 }, (_, i) => ({
     id: `w${i}`,
-    x1: 0,
-    z1: 0,
-    x2: 4,
-    z2: 0,
+    x1: -2,
+    z1: (i - 70) * 0.5,
+    x2: 2,
+    z2: (i - 70) * 0.5,
     height: 3,
     thickness: 0.2,
     color: '#ece8e0',

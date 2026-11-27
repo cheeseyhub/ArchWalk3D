@@ -1,4 +1,5 @@
 import { normalizeFurnitureParts } from './furnitureCatalog';
+import { sanitizeBlueprint } from './sanitizeBlueprint';
 import type {
   BlueprintBounds,
   BlueprintFurniture,
@@ -29,8 +30,15 @@ const VALID_FURNITURE_TYPES = new Set<FurnitureType>([
   'counter',
   'toilet',
   'sink',
+  'bathtub',
   'plant',
   'tv_stand',
+  'rug',
+  'coffee_table',
+  'bookshelf',
+  'wardrobe',
+  'fridge',
+  'floor_lamp',
 ]);
 
 const DEFAULT_FURNITURE_DIMS: Record<
@@ -45,8 +53,15 @@ const DEFAULT_FURNITURE_DIMS: Record<
   counter: { width: 2.4, depth: 0.65, height: 0.9, color: '#e5e2dc' },
   toilet: { width: 0.44, depth: 0.68, height: 0.78, color: '#f4f4f2' },
   sink: { width: 0.85, depth: 0.52, height: 0.86, color: '#e8e5df' },
+  bathtub: { width: 1.72, depth: 0.78, height: 0.58, color: '#f6f6f3' },
   plant: { width: 0.52, depth: 0.52, height: 1.35, color: '#4c724b' },
   tv_stand: { width: 1.7, depth: 0.44, height: 0.52, color: '#463930' },
+  rug: { width: 2.6, depth: 1.8, height: 0.02, color: '#cfc6b8' },
+  coffee_table: { width: 1.2, depth: 0.68, height: 0.42, color: '#8f6542' },
+  bookshelf: { width: 1.15, depth: 0.36, height: 1.85, color: '#6b4f39' },
+  wardrobe: { width: 1.4, depth: 0.62, height: 2.1, color: '#7f5e42' },
+  fridge: { width: 0.82, depth: 0.74, height: 1.88, color: '#cfd5dc' },
+  floor_lamp: { width: 0.44, depth: 0.44, height: 1.68, color: '#e6d8be' },
 };
 
 function clamp(val: number, min: number, max: number): number {
@@ -277,7 +292,7 @@ export function normalizeBlueprint(raw: unknown): SpatialBlueprint {
           : 0,
         width: clamp(Number(f.width ?? defaults.width), 0.2, 6.0),
         depth: clamp(Number(f.depth ?? defaults.depth), 0.2, 4.5),
-        height: clamp(Number(f.height ?? defaults.height), 0.2, 3.2),
+        height: clamp(Number(f.height ?? defaults.height), 0.015, 3.2),
         color,
       };
       if (typeof f.id === 'string' && f.id.trim().length > 0) {
@@ -293,7 +308,13 @@ export function normalizeBlueprint(raw: unknown): SpatialBlueprint {
     })
     .filter((f): f is BlueprintFurniture => f !== null);
 
-  const preliminary: SpatialBlueprint = { name, roof, rooms, walls, furniture };
+  const preliminary: SpatialBlueprint = sanitizeBlueprint({
+    name,
+    roof,
+    rooms,
+    walls,
+    furniture,
+  });
   const bounds = computeBlueprintBounds(preliminary);
 
   // Recenter blueprint neatly around [0, 0] if shifted noticeably
@@ -305,21 +326,21 @@ export function normalizeBlueprint(raw: unknown): SpatialBlueprint {
   }
 
   return {
-    name,
-    roof,
-    rooms: rooms.map((r) => ({
+    name: preliminary.name,
+    roof: preliminary.roof,
+    rooms: preliminary.rooms.map((r) => ({
       ...r,
       x: Number((r.x - shiftX).toFixed(3)),
       z: Number((r.z - shiftZ).toFixed(3)),
     })),
-    walls: walls.map((w) => ({
+    walls: preliminary.walls.map((w) => ({
       ...w,
       x1: Number((w.x1 - shiftX).toFixed(3)),
       z1: Number((w.z1 - shiftZ).toFixed(3)),
       x2: Number((w.x2 - shiftX).toFixed(3)),
       z2: Number((w.z2 - shiftZ).toFixed(3)),
     })),
-    furniture: furniture.map((f) => ({
+    furniture: preliminary.furniture.map((f) => ({
       ...f,
       x: Number((f.x - shiftX).toFixed(3)),
       z: Number((f.z - shiftZ).toFixed(3)),

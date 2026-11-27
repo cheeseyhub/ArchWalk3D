@@ -28,8 +28,15 @@ const VALID_BASE_TYPES = new Set<FurnitureType>([
   'counter',
   'toilet',
   'sink',
+  'bathtub',
   'plant',
   'tv_stand',
+  'rug',
+  'coffee_table',
+  'bookshelf',
+  'wardrobe',
+  'fridge',
+  'floor_lamp',
 ]);
 const VALID_CATEGORIES = new Set<FurnitureCategory>([
   'sofa',

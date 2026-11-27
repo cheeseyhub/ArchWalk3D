@@ -2,29 +2,44 @@ import * as THREE from 'three';
 import { computeBlueprintBounds } from '../arch/blueprint';
 import type { SpatialBlueprint } from '../arch/types';
 import { decomposeWall } from '../arch/wallGeometry';
-import { buildFurnitureGroup } from './buildFurniture';
-import { createFloorMaterial, type ProceduralTextureSet } from './textures';
+import { buildFurnitureGroup, getFurnitureStableKey } from './buildFurniture';
+import {
+  createFloorMaterial,
+  createWallPlasterMaterial,
+  type ProceduralTextureSet,
+} from './textures';
 
 export interface BuiltArchitecture {
   rootGroup: THREE.Group;
   roofGroup: THREE.Group;
   furnitureGroup: THREE.Group;
+  interiorLights: THREE.PointLight[];
+  downlightMaterial: THREE.MeshStandardMaterial;
   bounds: ReturnType<typeof computeBlueprintBounds>;
 }
 
 /**
- * Safely disposes all geometries, materials, and cloned textures inside a Three.js hierarchy.
+ * Safely disposes all unique geometries, materials, and non-shared textures inside a Three.js hierarchy.
  */
 export function disposeObject3D(root: THREE.Object3D, sharedTextures?: Set<THREE.Texture>): void {
+  const disposedGeometries = new Set<THREE.BufferGeometry>();
+  const disposedMaterials = new Set<THREE.Material>();
+
   root.traverse((node) => {
-    if (node instanceof THREE.Mesh) {
-      node.geometry?.dispose();
+    if (node instanceof THREE.Mesh || node instanceof THREE.LineSegments) {
+      if (node.geometry && !disposedGeometries.has(node.geometry)) {
+        disposedGeometries.add(node.geometry);
+        node.geometry.dispose();
+      }
       const mats = Array.isArray(node.material) ? node.material : [node.material];
       for (const mat of mats) {
-        if (!mat) continue;
+        if (!mat || disposedMaterials.has(mat)) continue;
+        disposedMaterials.add(mat);
         if (mat instanceof THREE.MeshStandardMaterial || mat instanceof THREE.MeshPhysicalMaterial) {
           if (mat.map && !sharedTextures?.has(mat.map)) mat.map.dispose();
           if (mat.bumpMap && !sharedTextures?.has(mat.bumpMap)) mat.bumpMap.dispose();
+          if (mat.normalMap && !sharedTextures?.has(mat.normalMap)) mat.normalMap.dispose();
+          if (mat.roughnessMap && !sharedTextures?.has(mat.roughnessMap)) mat.roughnessMap.dispose();
         }
         mat.dispose();
       }
@@ -32,32 +47,44 @@ export function disposeObject3D(root: THREE.Object3D, sharedTextures?: Set<THREE
   });
 }
 
-function buildStylizedTree(x: number, z: number, scale: number): THREE.Group {
+interface TreeSharedAssets {
+  trunkMat: THREE.MeshStandardMaterial;
+  foliageDark: THREE.MeshStandardMaterial;
+  foliageLight: THREE.MeshStandardMaterial;
+  trunkGeo: THREE.CylinderGeometry;
+  crown1Geo: THREE.DodecahedronGeometry;
+  crown2Geo: THREE.DodecahedronGeometry;
+  crown3Geo: THREE.DodecahedronGeometry;
+}
+
+function buildStylizedTree(
+  x: number,
+  z: number,
+  scale: number,
+  shared: TreeSharedAssets,
+): THREE.Group {
   const tree = new THREE.Group();
   tree.position.set(x, -0.18, z);
+  tree.scale.setScalar(scale);
 
-  const trunkMat = new THREE.MeshStandardMaterial({ color: '#4d3a2c', roughness: 0.9 });
-  const foliageDark = new THREE.MeshStandardMaterial({ color: '#39533f', roughness: 0.82 });
-  const foliageLight = new THREE.MeshStandardMaterial({ color: '#4c6a50', roughness: 0.78 });
-
-  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.11 * scale, 0.17 * scale, 1.45 * scale, 8), trunkMat);
-  trunk.position.y = 0.72 * scale;
+  const trunk = new THREE.Mesh(shared.trunkGeo, shared.trunkMat);
+  trunk.position.y = 0.72;
   trunk.castShadow = true;
   trunk.receiveShadow = true;
   tree.add(trunk);
 
-  const crown1 = new THREE.Mesh(new THREE.DodecahedronGeometry(0.95 * scale, 1), foliageDark);
-  crown1.position.set(0, 1.95 * scale, 0);
+  const crown1 = new THREE.Mesh(shared.crown1Geo, shared.foliageDark);
+  crown1.position.set(0, 1.95, 0);
   crown1.castShadow = true;
   tree.add(crown1);
 
-  const crown2 = new THREE.Mesh(new THREE.DodecahedronGeometry(0.72 * scale, 1), foliageLight);
-  crown2.position.set(0.45 * scale, 2.35 * scale, 0.28 * scale);
+  const crown2 = new THREE.Mesh(shared.crown2Geo, shared.foliageLight);
+  crown2.position.set(0.45, 2.35, 0.28);
   crown2.castShadow = true;
   tree.add(crown2);
 
-  const crown3 = new THREE.Mesh(new THREE.DodecahedronGeometry(0.65 * scale, 1), foliageLight);
-  crown3.position.set(-0.42 * scale, 2.2 * scale, -0.22 * scale);
+  const crown3 = new THREE.Mesh(shared.crown3Geo, shared.foliageLight);
+  crown3.position.set(-0.42, 2.2, -0.22);
   crown3.castShadow = true;
   tree.add(crown3);
 
@@ -72,7 +99,8 @@ function buildStylizedTree(x: number, z: number, scale: number): THREE.Group {
 export function buildArchitectureScene(
   blueprint: SpatialBlueprint,
   textures: ProceduralTextureSet,
-  isSoftwareGl: boolean,
+  _isSoftwareGl: boolean,
+  interactiveStates?: Map<string, boolean>,
 ): BuiltArchitecture {
   const rootGroup = new THREE.Group();
   rootGroup.name = 'architecture-root';
@@ -80,12 +108,11 @@ export function buildArchitectureScene(
   roofGroup.name = 'roof-cutaway-group';
 
   const bounds = computeBlueprintBounds(blueprint);
+  const materialCache = new Map<string, THREE.MeshStandardMaterial>();
 
   // 1. Architectural Site Ground & Foundation Plinth
   const siteSize = Math.max(70, Math.max(bounds.width, bounds.depth) * 6);
-  const gridTex = textures.groundGrid.clone();
-  gridTex.needsUpdate = true;
-  gridTex.repeat.set(siteSize / 4, siteSize / 4);
+  const gridTex = textures.getCachedGroundGrid(siteSize / 4);
 
   const siteGround = new THREE.Mesh(
     new THREE.PlaneGeometry(siteSize, siteSize),
@@ -98,6 +125,8 @@ export function buildArchitectureScene(
   siteGround.rotation.x = -Math.PI / 2;
   siteGround.position.y = -0.18;
   siteGround.receiveShadow = true;
+  siteGround.name = 'site-ground-grid';
+  siteGround.userData.excludeFromExport = true;
   rootGroup.add(siteGround);
 
   // Subtle architectural stone terrace plinth beneath the building
@@ -106,17 +135,27 @@ export function buildArchitectureScene(
     new THREE.BoxGeometry(bounds.width + plinthPad * 2, 0.18, bounds.depth + plinthPad * 2),
     new THREE.MeshStandardMaterial({
       color: '#2c3038',
-      roughness: 0.82,
+      roughness: 1.0,
       metalness: 0.06,
-      bumpMap: textures.concreteBump,
-      bumpScale: 0.015,
+      normalMap: textures.concrete.normalMap,
+      normalScale: new THREE.Vector2(0.45, 0.45),
+      roughnessMap: textures.concrete.roughnessMap,
     }),
   );
   plinthMesh.position.set(bounds.centerX, -0.09, bounds.centerZ);
   plinthMesh.receiveShadow = true;
   rootGroup.add(plinthMesh);
 
-  // Architectural site context trees positioned cleanly outside the building footprint
+  // Architectural site context trees sharing geometries & materials
+  const treeAssets: TreeSharedAssets = {
+    trunkMat: new THREE.MeshStandardMaterial({ color: '#4d3a2c', roughness: 0.9 }),
+    foliageDark: new THREE.MeshStandardMaterial({ color: '#39533f', roughness: 0.82 }),
+    foliageLight: new THREE.MeshStandardMaterial({ color: '#4c6a50', roughness: 0.78 }),
+    trunkGeo: new THREE.CylinderGeometry(0.11, 0.17, 1.45, 8),
+    crown1Geo: new THREE.DodecahedronGeometry(0.95, 1),
+    crown2Geo: new THREE.DodecahedronGeometry(0.72, 1),
+    crown3Geo: new THREE.DodecahedronGeometry(0.65, 1),
+  };
   const treeOffsetX = bounds.width / 2 + 4.4;
   const treeOffsetZ = bounds.depth / 2 + 3.8;
   const treeCoords: Array<[number, number, number]> = [
@@ -126,7 +165,7 @@ export function buildArchitectureScene(
     [bounds.centerX + treeOffsetX * 0.95, bounds.centerZ + treeOffsetZ * 0.85, 1.2],
   ];
   for (const [tx, tz, sc] of treeCoords) {
-    rootGroup.add(buildStylizedTree(tx, tz, sc));
+    rootGroup.add(buildStylizedTree(tx, tz, sc, treeAssets));
   }
 
   // 2. Room Floors (offset at y = 0.01 to avoid coplanar Z-fighting with plinth)
@@ -137,6 +176,7 @@ export function buildArchitectureScene(
       room.width,
       room.depth,
       textures,
+      materialCache,
     );
     const floorMesh = new THREE.Mesh(
       new THREE.PlaneGeometry(room.width, room.depth),
@@ -149,7 +189,7 @@ export function buildArchitectureScene(
     rootGroup.add(floorMesh);
   }
 
-  // Shared trim, frame, and glass materials for architectural openings
+  // Shared trim, frame, and reflective glass materials (no expensive transmission pass)
   const windowFrameMat = new THREE.MeshStandardMaterial({
     color: '#252930',
     roughness: 0.36,
@@ -175,15 +215,13 @@ export function buildArchitectureScene(
     roughness: 0.65,
     metalness: 0.03,
   });
-  const glassMat = new THREE.MeshPhysicalMaterial({
+  const glassMat = new THREE.MeshStandardMaterial({
     color: '#cde2f0',
-    roughness: 0.08,
-    metalness: 0.05,
-    transmission: isSoftwareGl ? 0 : 0.72,
-    ior: 1.5,
-    thickness: 0.04,
     transparent: true,
-    opacity: isSoftwareGl ? 0.32 : 0.42,
+    opacity: 0.28,
+    roughness: 0.08,
+    metalness: 0.2,
+    envMapIntensity: 1.5,
     depthWrite: false,
   });
 
@@ -197,13 +235,13 @@ export function buildArchitectureScene(
     wallGroup.position.set(wall.x1, 0, wall.z1);
     wallGroup.rotation.y = -decomp.angle;
 
-    const wallMat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(wall.color),
-      bumpMap: textures.plasterBump,
-      bumpScale: 0.008,
-      roughness: 0.84,
-      metalness: 0.02,
-    });
+    const wallMat = createWallPlasterMaterial(
+      wall.color,
+      decomp.length,
+      wall.height,
+      textures,
+      materialCache,
+    );
 
     for (const seg of decomp.segments) {
       const segMesh = new THREE.Mesh(
@@ -344,8 +382,13 @@ export function buildArchitectureScene(
   // 4. Composite Procedural Furniture (isolated group for fast interactive edits)
   const furnitureGroup = new THREE.Group();
   furnitureGroup.name = 'furniture-root-group';
-  for (const item of blueprint.furniture) {
-    const fGroup = buildFurnitureGroup(item, textures);
+  for (let i = 0; i < blueprint.furniture.length; i++) {
+    const item = blueprint.furniture[i];
+    const key = getFurnitureStableKey(item, i);
+    const fGroup = buildFurnitureGroup(item, textures, {
+      index: i,
+      initialActive: interactiveStates?.get(key),
+    });
     furnitureGroup.add(fGroup);
   }
   rootGroup.add(furnitureGroup);
@@ -363,10 +406,12 @@ export function buildArchitectureScene(
   });
   const roofMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(blueprint.roof.color),
-    bumpMap: textures.roofBump,
-    bumpScale: 0.03,
-    roughness: 0.52,
-    metalness: 0.22,
+    map: textures.roof.map,
+    normalMap: textures.roof.normalMap,
+    normalScale: new THREE.Vector2(0.6, 0.6),
+    roughnessMap: textures.roof.roughnessMap,
+    roughness: 1.0,
+    metalness: 0.24,
   });
   const fasciaMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(blueprint.roof.color).multiplyScalar(0.68),
@@ -386,7 +431,7 @@ export function buildArchitectureScene(
   const downlightMat = new THREE.MeshStandardMaterial({
     color: '#fff6e5',
     emissive: new THREE.Color('#ffdfa8'),
-    emissiveIntensity: 1.5,
+    emissiveIntensity: 1.1,
     roughness: 0.2,
   });
 
@@ -395,6 +440,7 @@ export function buildArchitectureScene(
     .sort((a, b) => b.width * b.depth - a.width * a.depth)
     .slice(0, 4);
   const litRoomIds = new Set(largestRooms.map((r) => r.id));
+  const interiorLights: THREE.PointLight[] = [];
 
   for (const room of blueprint.rooms) {
     const fixture = new THREE.Mesh(
@@ -405,9 +451,11 @@ export function buildArchitectureScene(
     roofGroup.add(fixture);
 
     if (litRoomIds.has(room.id)) {
-      const interiorLight = new THREE.PointLight(0xffe9c8, 1.35, 11, 1.6);
+      const interiorLight = new THREE.PointLight(0xfff0d4, 1.05, 12, 1.6);
+      interiorLight.castShadow = false;
       interiorLight.position.set(room.x, wallH - 0.35, room.z);
       rootGroup.add(interiorLight);
+      interiorLights.push(interiorLight);
     }
   }
 
@@ -473,12 +521,13 @@ export function buildArchitectureScene(
     // Center extrusion around Z = 0 so both West and East gable walls sit symmetrically flush
     gableWallGeo.translate(0, 0, -0.12);
 
-    const gableWallMat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(blueprint.walls[0]?.color ?? '#ece8e0'),
-      bumpMap: textures.plasterBump,
-      bumpScale: 0.008,
-      roughness: 0.85,
-    });
+    const gableWallMat = createWallPlasterMaterial(
+      blueprint.walls[0]?.color ?? '#ece8e0',
+      innerHalfSpan * 2,
+      gableWallH,
+      textures,
+      materialCache,
+    );
 
     const endOffset = (ridgeAlongX ? bounds.width : bounds.depth) / 2;
     for (const sx of [-1, 1]) {
@@ -529,6 +578,8 @@ export function buildArchitectureScene(
     rootGroup,
     roofGroup,
     furnitureGroup,
+    interiorLights,
+    downlightMaterial: downlightMat,
     bounds,
   };
 }

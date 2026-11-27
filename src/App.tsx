@@ -1,26 +1,57 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import { computeBlueprintBounds } from './arch/blueprint';
+import {
+  canRedo,
+  canUndo,
+  createCatalogFurnitureItem,
+  createHistory,
+  duplicateFurnitureAt,
+  moveFurnitureAt,
+  pushHistory,
+  recolorFurnitureAt,
+  redoHistory,
+  removeFurnitureAt,
+  resizeFurnitureAt,
+  rotateFurnitureAt,
+  setFurnitureRotationAt,
+  undoHistory,
+  type HistoryState,
+} from './arch/blueprintHistory';
 import { DEMO_HOUSE_BLUEPRINT } from './arch/demoHouse';
 import {
   STARTER_FURNITURE_ASSETS,
   createPlacedFurnitureItem,
 } from './arch/furnitureCatalog';
+import { createGriddedImageBase64 } from './arch/gridOverlay';
 import { SseStreamParser, type ParsedSseEvent } from './arch/sseParser';
 import type { BlueprintStreamProgress } from './arch/streamProgress';
 import type {
   BlueprintFurniture,
   CameraMode,
+  FurnitureType,
   GeneratedFurnitureAsset,
+  HoveredFurnitureInfo,
   InputMode,
+  LightingPreset,
+  RenderQuality,
   SpatialBlueprint,
 } from './arch/types';
-import { ArchViewport, type TeleportRequest } from './components/ArchViewport';
+import { AddFurniturePopover } from './components/AddFurniturePopover';
+import {
+  ArchViewport,
+  type ArchViewportHandle,
+  type FurniturePreviewPatch,
+  type TeleportRequest,
+} from './components/ArchViewport';
 import { AuthGate } from './components/AuthGate';
 import {
   BuildProgressOverlay,
   type BuildProgressState,
   type BuildStageId,
 } from './components/BuildProgressOverlay';
+import { FurnitureInspector } from './components/FurnitureInspector';
+import { InteractionHud } from './components/InteractionHud';
 import { PlacementHud } from './components/PlacementHud';
 import { StudioSidebar, type SidebarTab } from './components/StudioSidebar';
 import { ViewportToolbar } from './components/ViewportToolbar';
@@ -58,30 +89,10 @@ const EMPTY_STREAM_PROGRESS: BlueprintStreamProgress = {
 function createInitialBuildProgress(): BuildProgressState {
   return {
     stage: 'analyzing',
-    statusText: 'Preparing architectural image...',
+    statusText: 'Applying spatial calibration grid...',
     elapsedMs: 0,
     stream: EMPTY_STREAM_PROGRESS,
   };
-}
-
-function readFileAsBase64(file: File): Promise<{ base64: string; mimeType: string }> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result ?? '');
-      const commaIdx = result.indexOf(',');
-      if (commaIdx === -1) {
-        reject(new Error('Could not read uploaded image file.'));
-        return;
-      }
-      resolve({
-        base64: result.slice(commaIdx + 1),
-        mimeType: file.type || 'image/png',
-      });
-    };
-    reader.onerror = () => reject(new Error('Failed to read the selected image.'));
-    reader.readAsDataURL(file);
-  });
 }
 
 export default function App() {
@@ -104,9 +115,10 @@ export default function App() {
   );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const [blueprint, setBlueprint] = useState<SpatialBlueprint>(
-    initialCache?.blueprint ?? DEMO_HOUSE_BLUEPRINT,
+  const [blueprintHistory, setBlueprintHistory] = useState<HistoryState<SpatialBlueprint>>(
+    () => createHistory(initialCache?.blueprint ?? DEMO_HOUSE_BLUEPRINT),
   );
+  const blueprint = blueprintHistory.present;
   const [activeSavedId, setActiveSavedId] = useState<string | null>(
     initialCache?.savedDocId ?? null,
   );
@@ -130,13 +142,25 @@ export default function App() {
   const [placingAsset, setPlacingAsset] = useState<GeneratedFurnitureAsset | null>(null);
   const [placementRotationY, setPlacementRotationY] = useState(0);
 
+  // Interactive Furniture & Arrange Mode state
+  const [arrangeMode, setArrangeMode] = useState(false);
+  const [selectedFurnitureIndex, setSelectedFurnitureIndex] = useState<number | null>(null);
+  const [hoveredInteraction, setHoveredInteraction] = useState<HoveredFurnitureInfo | null>(null);
+  const [isSeated, setIsSeated] = useState(false);
+
   const [cameraMode, setCameraMode] = useState<CameraMode>('orbit');
+  const [lightingPreset, setLightingPreset] = useState<LightingPreset>('daylight');
+  const [renderQuality, setRenderQuality] = useState<RenderQuality>('fast');
   const [showRoof, setShowRoof] = useState(true);
   const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
   const [teleportRequest, setTeleportRequest] = useState<TeleportRequest | null>(null);
   const [resetNonce, setResetNonce] = useState(0);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
+  const [isExportingGltf, setIsExportingGltf] = useState(false);
+  const [exportSuccess, setExportSuccess] = useState(false);
 
+  const viewportRef = useRef<ArchViewportHandle | null>(null);
+  const exportResetTimerRef = useRef<number | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const userManuallySelectedRef = useRef(false);
   const hasRestoredFromFirestoreRef = useRef(false);
@@ -185,7 +209,8 @@ export default function App() {
             (initialCacheRef.current ? null : records[0]);
 
           if (preferred) {
-            setBlueprint(preferred.blueprint);
+            setBlueprintHistory(createHistory(preferred.blueprint));
+            setSelectedFurnitureIndex(null);
             setActiveSavedId(preferred.id);
             setInputMode(preferred.inputMode);
             setPrompt(preferred.prompt);
@@ -248,10 +273,13 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [isGenerating]);
 
-  // Abort any in-flight request on unmount
+  // Abort any in-flight request and clear export feedback timer on unmount
   useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
+      if (exportResetTimerRef.current !== null) {
+        window.clearTimeout(exportResetTimerRef.current);
+      }
     };
   }, []);
 
@@ -288,7 +316,11 @@ export default function App() {
       setSavedModels([]);
       setGeneratedFurnitureCatalog([]);
       setPlacingAsset(null);
-      setBlueprint({ ...DEMO_HOUSE_BLUEPRINT });
+      setArrangeMode(false);
+      setSelectedFurnitureIndex(null);
+      setHoveredInteraction(null);
+      setIsSeated(false);
+      setBlueprintHistory(createHistory({ ...DEMO_HOUSE_BLUEPRINT }));
       setIsUsingDemo(true);
       setActiveRoomId(null);
       setCameraMode('orbit');
@@ -403,7 +435,9 @@ export default function App() {
         throw new Error('Please sign in with Google to generate a 3D model.');
       }
       const idToken = await currentUser.getIdToken();
-      const { base64, mimeType } = await readFileAsBase64(imageFile);
+      // Pre-process on an offscreen HTML5 Canvas with a faint 10x10 A-J / 1-10 grid for Gemini
+      // while keeping the user's clean original upload in imagePreviewUrl
+      const { base64, mimeType } = await createGriddedImageBase64(imageFile);
 
       const response = await fetch('/api/blueprint/generate-stream', {
         method: 'POST',
@@ -546,7 +580,9 @@ export default function App() {
       }
 
       userManuallySelectedRef.current = true;
-      setBlueprint(completedBlueprint);
+      setBlueprintHistory(createHistory(completedBlueprint));
+      setArrangeMode(false);
+      setSelectedFurnitureIndex(null);
       setIsUsingDemo(false);
       setActiveSavedId(null);
       setActiveRoomId(null);
@@ -570,42 +606,106 @@ export default function App() {
     }
   }, [imageFile, inputMode, prompt, persistBlueprintIfSignedIn]);
 
-  // Helper to commit furniture edits inside the active house to localStorage + Firestore
-  const commitBlueprintFurniture = useCallback(
-    (updater: (prevFurniture: BlueprintFurniture[]) => BlueprintFurniture[]) => {
-      setBlueprint((prev) => {
-        const nextFurniture = updater(prev.furniture).slice(0, 150);
-        const nextBlueprint: SpatialBlueprint = {
-          ...prev,
-          furniture: nextFurniture,
-        };
-
-        saveLocalCachedModel({
-          savedDocId: activeSavedId,
-          inputMode,
-          prompt,
-          blueprint: nextBlueprint,
-          savedAtMs: Date.now(),
-        });
-
-        if (activeSavedId && auth.currentUser) {
-          setIsSavingToDb(true);
-          void updateBlueprintFurnitureInFirestore(activeSavedId, nextFurniture)
-            .catch((err: unknown) => {
-              setFurnitureError(
-                err instanceof Error
-                  ? `Furniture placed locally, but syncing to database failed: ${err.message}`
-                  : 'Furniture placed locally, but syncing to database failed.',
-              );
-            })
-            .finally(() => setIsSavingToDb(false));
-        }
-
-        return nextBlueprint;
+  const syncPersistedFurniture = useCallback(
+    (nextBlueprint: SpatialBlueprint) => {
+      saveLocalCachedModel({
+        savedDocId: activeSavedId,
+        inputMode,
+        prompt,
+        blueprint: nextBlueprint,
+        savedAtMs: Date.now(),
       });
+
+      if (activeSavedId && auth.currentUser) {
+        setIsSavingToDb(true);
+        void updateBlueprintFurnitureInFirestore(activeSavedId, nextBlueprint.furniture)
+          .catch((err: unknown) => {
+            setFurnitureError(
+              err instanceof Error
+                ? `Furniture updated locally, but syncing to database failed: ${err.message}`
+                : 'Furniture updated locally, but syncing to database failed.',
+            );
+          })
+          .finally(() => setIsSavingToDb(false));
+      }
     },
     [activeSavedId, inputMode, prompt],
   );
+
+  // Push ONE snapshot to Undo/Redo history & sync to localStorage + Firestore
+  const commitBlueprintMutation = useCallback(
+    (updater: (prevBlueprint: SpatialBlueprint) => SpatialBlueprint) => {
+      setBlueprintHistory((prevHistory) => {
+        const nextBlueprint = updater(prevHistory.present);
+        if (nextBlueprint === prevHistory.present) return prevHistory;
+        syncPersistedFurniture(nextBlueprint);
+        return pushHistory(prevHistory, nextBlueprint);
+      });
+    },
+    [syncPersistedFurniture],
+  );
+
+  // Helper to commit furniture array edits inside the active house
+  const commitBlueprintFurniture = useCallback(
+    (updater: (prevFurniture: BlueprintFurniture[]) => BlueprintFurniture[]) => {
+      commitBlueprintMutation((prev) => ({
+        ...prev,
+        furniture: updater(prev.furniture).slice(0, 150),
+      }));
+    },
+    [commitBlueprintMutation],
+  );
+
+  const handleUndo = useCallback(() => {
+    setBlueprintHistory((prevHistory) => {
+      if (!canUndo(prevHistory)) return prevHistory;
+      const nextHistory = undoHistory(prevHistory);
+      syncPersistedFurniture(nextHistory.present);
+      setSelectedFurnitureIndex((idx) =>
+        idx !== null && idx < nextHistory.present.furniture.length ? idx : null,
+      );
+      return nextHistory;
+    });
+  }, [syncPersistedFurniture]);
+
+  const handleRedo = useCallback(() => {
+    setBlueprintHistory((prevHistory) => {
+      if (!canRedo(prevHistory)) return prevHistory;
+      const nextHistory = redoHistory(prevHistory);
+      syncPersistedFurniture(nextHistory.present);
+      setSelectedFurnitureIndex((idx) =>
+        idx !== null && idx < nextHistory.present.furniture.length ? idx : null,
+      );
+      return nextHistory;
+    });
+  }, [syncPersistedFurniture]);
+
+  // Global Ctrl/Cmd+Z (Undo) and Ctrl/Cmd+Shift+Z / Ctrl+Y (Redo) shortcuts
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod) return;
+      const key = e.key.toLowerCase();
+      if (key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+      } else if ((key === 'z' && e.shiftKey) || (key === 'y' && !e.shiftKey)) {
+        e.preventDefault();
+        handleRedo();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleUndo, handleRedo]);
 
   const handleGenerateFurniture = useCallback(async () => {
     const cleaned = furniturePrompt.trim();
@@ -691,6 +791,8 @@ export default function App() {
 
   const handleTogglePlaceAsset = useCallback((asset: GeneratedFurnitureAsset) => {
     setFurnitureError(null);
+    setArrangeMode(false);
+    setSelectedFurnitureIndex(null);
     setPlacingAsset((prev) => {
       if (prev?.id === asset.id) {
         return null;
@@ -704,6 +806,111 @@ export default function App() {
       return asset;
     });
   }, []);
+
+  const handleToggleArrangeMode = useCallback(() => {
+    setArrangeMode((prev) => {
+      const next = !prev;
+      if (next) {
+        setPlacingAsset(null);
+        setHoveredInteraction(null);
+        setCameraMode('orbit');
+        setActiveRoomId(null);
+        setShowRoof(false); // Open cutaway so interior furniture is immediately selectable
+      } else {
+        setSelectedFurnitureIndex(null);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleCommitMoveFurniture = useCallback(
+    (index: number, x: number, z: number) => {
+      commitBlueprintMutation((prev) => moveFurnitureAt(prev, index, x, z));
+    },
+    [commitBlueprintMutation],
+  );
+
+  const handleRotateSelectedFurniture = useCallback(
+    (deltaRadians: number) => {
+      if (selectedFurnitureIndex === null) return;
+      commitBlueprintMutation((prev) =>
+        rotateFurnitureAt(prev, selectedFurnitureIndex, deltaRadians),
+      );
+    },
+    [selectedFurnitureIndex, commitBlueprintMutation],
+  );
+
+  const handleSetRotationSelectedFurniture = useCallback(
+    (radians: number) => {
+      if (selectedFurnitureIndex === null) return;
+      commitBlueprintMutation((prev) =>
+        setFurnitureRotationAt(prev, selectedFurnitureIndex, radians),
+      );
+    },
+    [selectedFurnitureIndex, commitBlueprintMutation],
+  );
+
+  const handleResizeSelectedFurniture = useCallback(
+    (width: number, depth: number, height: number) => {
+      if (selectedFurnitureIndex === null) return;
+      commitBlueprintMutation((prev) =>
+        resizeFurnitureAt(prev, selectedFurnitureIndex, width, depth, height),
+      );
+    },
+    [selectedFurnitureIndex, commitBlueprintMutation],
+  );
+
+  const handlePreviewFurnitureEdit = useCallback(
+    (patch: FurniturePreviewPatch) => {
+      if (selectedFurnitureIndex === null) return;
+      viewportRef.current?.previewFurnitureEdit(selectedFurnitureIndex, patch);
+    },
+    [selectedFurnitureIndex],
+  );
+
+  const handleRecolorSelectedFurniture = useCallback(
+    (hexColor: string) => {
+      if (selectedFurnitureIndex === null) return;
+      commitBlueprintMutation((prev) =>
+        recolorFurnitureAt(prev, selectedFurnitureIndex, hexColor),
+      );
+    },
+    [selectedFurnitureIndex, commitBlueprintMutation],
+  );
+
+  const handleDuplicateSelectedFurniture = useCallback(() => {
+    if (selectedFurnitureIndex === null) return;
+    const source = blueprint.furniture[selectedFurnitureIndex];
+    if (!source || blueprint.furniture.length >= 150) return;
+    const nextIdx = blueprint.furniture.length;
+    commitBlueprintMutation((prev) => {
+      const bounds = computeBlueprintBounds(prev);
+      return duplicateFurnitureAt(prev, selectedFurnitureIndex, bounds).blueprint;
+    });
+    setSelectedFurnitureIndex(nextIdx);
+  }, [selectedFurnitureIndex, blueprint.furniture, commitBlueprintMutation]);
+
+  const handleDeleteSelectedFurniture = useCallback(() => {
+    if (selectedFurnitureIndex === null) return;
+    const targetIdx = selectedFurnitureIndex;
+    commitBlueprintMutation((prev) => removeFurnitureAt(prev, targetIdx));
+    setSelectedFurnitureIndex(null);
+  }, [selectedFurnitureIndex, commitBlueprintMutation]);
+
+  const handleAddProceduralFurniture = useCallback(
+    (type: FurnitureType) => {
+      if (blueprint.furniture.length >= 150) return;
+      const center = viewportRef.current?.getViewportSpawnCenter() ?? { x: 0, z: 0 };
+      const newItem = createCatalogFurnitureItem(type, center.x, center.z);
+      const nextIdx = blueprint.furniture.length;
+      commitBlueprintMutation((prev) => ({
+        ...prev,
+        furniture: [...prev.furniture, newItem].slice(0, 150),
+      }));
+      setSelectedFurnitureIndex(nextIdx);
+    },
+    [blueprint.furniture.length, commitBlueprintMutation],
+  );
 
   const handlePlaceFurniture = useCallback(
     (x: number, z: number, rotY: number) => {
@@ -751,22 +958,21 @@ export default function App() {
 
   const handleRotatePlacedItem = useCallback(
     (index: number) => {
-      commitBlueprintFurniture((prev) =>
-        prev.map((item, idx) =>
-          idx === index
-            ? { ...item, rotationY: Number((item.rotationY + Math.PI / 4).toFixed(3)) }
-            : item,
-        ),
-      );
+      commitBlueprintMutation((prev) => rotateFurnitureAt(prev, index, Math.PI / 4));
     },
-    [commitBlueprintFurniture],
+    [commitBlueprintMutation],
   );
 
   const handleRemovePlacedItem = useCallback(
     (index: number) => {
-      commitBlueprintFurniture((prev) => prev.filter((_, idx) => idx !== index));
+      commitBlueprintMutation((prev) => removeFurnitureAt(prev, index));
+      setSelectedFurnitureIndex((cur) => {
+        if (cur === null) return null;
+        if (cur === index) return null;
+        return cur > index ? cur - 1 : cur;
+      });
     },
-    [commitBlueprintFurniture],
+    [commitBlueprintMutation],
   );
 
   const handleSaveCurrentToDb = useCallback(async () => {
@@ -779,7 +985,9 @@ export default function App() {
     userManuallySelectedRef.current = true;
     setErrorMessage(null);
     setPlacingAsset(null);
-    setBlueprint(record.blueprint);
+    setArrangeMode(false);
+    setSelectedFurnitureIndex(null);
+    setBlueprintHistory(createHistory(record.blueprint));
     setActiveSavedId(record.id);
     setInputMode(record.inputMode);
     setPrompt(record.prompt);
@@ -818,7 +1026,9 @@ export default function App() {
     userManuallySelectedRef.current = true;
     setErrorMessage(null);
     setPlacingAsset(null);
-    setBlueprint({ ...DEMO_HOUSE_BLUEPRINT });
+    setArrangeMode(false);
+    setSelectedFurnitureIndex(null);
+    setBlueprintHistory(createHistory({ ...DEMO_HOUSE_BLUEPRINT }));
     setActiveSavedId(null);
     setIsUsingDemo(true);
     setActiveRoomId(null);
@@ -829,6 +1039,8 @@ export default function App() {
 
   const handleSelectRoom = useCallback((roomId: string) => {
     setPlacingAsset(null);
+    setArrangeMode(false);
+    setSelectedFurnitureIndex(null);
     setActiveRoomId(roomId);
     setCameraMode('walk');
     setTeleportRequest((prev) => ({
@@ -843,6 +1055,8 @@ export default function App() {
   const handleCameraModeChange = useCallback((mode: CameraMode) => {
     if (mode === 'walk') {
       setPlacingAsset(null);
+      setArrangeMode(false);
+      setSelectedFurnitureIndex(null);
     }
     setCameraMode(mode);
     if (mode === 'orbit') {
@@ -853,6 +1067,30 @@ export default function App() {
   const handleResetView = useCallback(() => {
     setResetNonce((n) => n + 1);
   }, []);
+
+  const handleExportGltf = useCallback(async () => {
+    if (isExportingGltf || !viewportRef.current) return;
+    setErrorMessage(null);
+    setIsExportingGltf(true);
+    setExportSuccess(false);
+    try {
+      await viewportRef.current.exportGltf();
+      setExportSuccess(true);
+      if (exportResetTimerRef.current !== null) {
+        window.clearTimeout(exportResetTimerRef.current);
+      }
+      exportResetTimerRef.current = window.setTimeout(() => {
+        setExportSuccess(false);
+        exportResetTimerRef.current = null;
+      }, 2200);
+    } catch (err: unknown) {
+      setErrorMessage(
+        err instanceof Error ? err.message : 'Unable to export 3D model to GLTF.',
+      );
+    } finally {
+      setIsExportingGltf(false);
+    }
+  }, [isExportingGltf]);
 
   const activeRoomName =
     blueprint.rooms.find((r) => r.id === activeRoomId)?.name ?? null;
@@ -933,18 +1171,29 @@ export default function App() {
 
       <main className="relative flex-1 h-full min-w-0 overflow-hidden">
         <ArchViewport
+          ref={viewportRef}
           blueprint={blueprint}
           cameraMode={cameraMode}
           showRoof={showRoof}
+          lightingPreset={lightingPreset}
+          renderQuality={renderQuality}
           teleportRequest={teleportRequest}
           resetNonce={resetNonce}
           placingAsset={placingAsset}
           placementRotationY={placementRotationY}
+          arrangeMode={arrangeMode}
+          selectedFurnitureIndex={selectedFurnitureIndex}
           onPlaceFurniture={handlePlaceFurniture}
           onRotatePlacement={handleRotatePlacement}
           onCancelPlacement={handleCancelPlacement}
           onPointerLockChange={setIsPointerLocked}
           onActiveRoomChange={setActiveRoomId}
+          onSelectFurniture={setSelectedFurnitureIndex}
+          onCommitMoveFurniture={handleCommitMoveFurniture}
+          onHoveredInteractionChange={setHoveredInteraction}
+          onSeatedChange={setIsSeated}
+          onRotateSelected={handleRotateSelectedFurniture}
+          onDeleteSelected={handleDeleteSelectedFurniture}
         />
 
         <ViewportToolbar
@@ -952,9 +1201,61 @@ export default function App() {
           onOpenSidebar={() => setSidebarOpen(true)}
           cameraMode={cameraMode}
           onCameraModeChange={handleCameraModeChange}
+          arrangeMode={arrangeMode}
+          onToggleArrangeMode={handleToggleArrangeMode}
+          canUndo={canUndo(blueprintHistory)}
+          canRedo={canRedo(blueprintHistory)}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
+          lightingPreset={lightingPreset}
+          onLightingPresetChange={setLightingPreset}
+          renderQuality={renderQuality}
+          onToggleRenderQuality={() =>
+            setRenderQuality((prev) => (prev === 'high' ? 'fast' : 'high'))
+          }
           showRoof={showRoof}
           onToggleRoof={() => setShowRoof((prev) => !prev)}
           onResetView={handleResetView}
+          onExportGltf={handleExportGltf}
+          isExportingGltf={isExportingGltf}
+          exportSuccess={exportSuccess}
+        />
+
+        <AddFurniturePopover
+          visible={arrangeMode && cameraMode === 'orbit' && !placingAsset}
+          hasSelection={selectedFurnitureIndex !== null}
+          onAddItem={handleAddProceduralFurniture}
+          onExitArrange={() => {
+            setArrangeMode(false);
+            setSelectedFurnitureIndex(null);
+          }}
+        />
+
+        {cameraMode === 'orbit' &&
+          !placingAsset &&
+          selectedFurnitureIndex !== null &&
+          blueprint.furniture[selectedFurnitureIndex] && (
+            <FurnitureInspector
+              item={blueprint.furniture[selectedFurnitureIndex]}
+              index={selectedFurnitureIndex}
+              onRotate={handleRotateSelectedFurniture}
+              onSetRotation={handleSetRotationSelectedFurniture}
+              onResize={handleResizeSelectedFurniture}
+              onRecolor={handleRecolorSelectedFurniture}
+              onPreviewEdit={handlePreviewFurnitureEdit}
+              onDuplicate={handleDuplicateSelectedFurniture}
+              onDelete={handleDeleteSelectedFurniture}
+              onClose={() => setSelectedFurnitureIndex(null)}
+            />
+          )}
+
+        <InteractionHud
+          cameraMode={cameraMode}
+          arrangeMode={arrangeMode}
+          hasSelection={selectedFurnitureIndex !== null}
+          isPlacing={Boolean(placingAsset)}
+          hoveredInteraction={hoveredInteraction}
+          isSeated={isSeated}
         />
 
         <WalkModeHud

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { normalizeBlueprint } from './src/arch/blueprint';
 import { normalizeGeneratedFurnitureBatch } from './src/arch/furnitureCatalog';
+import { sanitizeBlueprint } from './src/arch/sanitizeBlueprint';
 import { parseBlueprintStreamProgress } from './src/arch/streamProgress';
 import type { InputMode } from './src/arch/types';
 
@@ -120,8 +121,15 @@ const BLUEPRINT_SCHEMA = {
               'counter',
               'toilet',
               'sink',
+              'bathtub',
               'plant',
               'tv_stand',
+              'rug',
+              'coffee_table',
+              'bookshelf',
+              'wardrobe',
+              'fridge',
+              'floor_lamp',
             ],
           },
           x: { type: Type.NUMBER },
@@ -235,11 +243,16 @@ Reconstruct the visible room's real-world dimensions, floor material and color, 
 
   return `${modeDirective}${notesBlock}
 
+COORDINATE GRID & REAL-WORLD SCALE CALIBRATION:
+- The input image has a faint 10x10 architectural reference grid overlaid across it: columns A–J run horizontally (left to right) and rows 1–10 run vertically (top to bottom).
+- Use the A–J and 1–10 grid lines as a precise visual ruler to align parallel walls, corner intersections, room proportions, and door/window placements along exact straight axes.
+- Anchor real-world scale strictly to architectural standards: standard single interior/exterior door widths = 0.9m (height 2.15m), standard ceiling/wall height = 2.8m (unless clearly double-height), and standard exterior/interior wall thicknesses = 0.22m / 0.14m.
+
 CRITICAL SPATIAL RULES:
 1. All coordinates are in real-world meters on the XZ ground plane, centered near [0, 0].
 2. Each room's (x, z) is its geometric CENTER, with width along X and depth along Z. Adjacent rooms must tile cleanly without overlapping or leaving stray gaps.
-3. Wall endpoints (x1, z1) to (x2, z2) must align precisely with room perimeters. Every opening's offset is measured in meters from (x1, z1) to the opening's start edge, so offset >= 0.15 and offset + width <= wallLength - 0.15.
-4. Every interior room must be reachable through at least one door opening (sillHeight: 0, width: 0.9 to 2.2, height: 2.15 to 2.35).
+3. Wall endpoints (x1, z1) to (x2, z2) must meet cleanly at shared corners and never duplicate collinear walls between adjacent rooms. Every opening's offset is measured in meters from (x1, z1) to the opening's start edge, so offset >= 0.15 and offset + width <= wallLength - 0.15.
+4. Every interior room must be reachable through at least one door opening (sillHeight: 0, width: 0.9m standard single door up to 1.8m wide opening, height: 2.15m).
 5. Place realistic furniture inside the rooms with proper clearance from walls and doorways (never block doors or place furniture outside room boundaries).
 6. Use natural, tasteful architectural hex colors (e.g., "#ece8e0" plaster, "#b7885a" oak, "#383e47" slate roof).`;
 }
@@ -262,7 +275,7 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 const SYSTEM_INSTRUCTION =
-  'You are a senior architectural spatial modeling engineer. Convert architectural floor plans, exterior photographs, and interior room photos into precise, walkable, single-story 3D spatial blueprints in real-world meters. Verify wall alignments, shared room boundaries, doorway connectivity, and realistic furniture clearances carefully.';
+  'You are a senior architectural spatial modeling engineer. Every input image includes a faint numbered 10x10 coordinate grid overlay (columns A-J horizontally, rows 1-10 vertically). Use this coordinate grid to achieve tight orthogonal wall alignment, accurate room proportions, and closed corners, and anchor real-world metric scale to standard 0.9m door widths and 2.8m wall heights. Convert architectural floor plans, exterior photographs, and interior room photos into precise, walkable, single-story 3D spatial blueprints in real-world meters without duplicate overlapping walls.';
 
 function classifyErrorStatus(message: string): number {
   if (/API_KEY|PERMISSION_DENIED|not configured/i.test(message)) return 401;
@@ -585,7 +598,7 @@ CRITICAL 3D MODELING RULES:
         return;
       }
 
-      const blueprint = normalizeBlueprint(parsed);
+      const blueprint = sanitizeBlueprint(normalizeBlueprint(parsed));
       emitSse('complete', {
         blueprint,
         elapsedMs: Date.now() - startedAt,
@@ -675,7 +688,7 @@ CRITICAL 3D MODELING RULES:
         return;
       }
 
-      const blueprint = normalizeBlueprint(parsed);
+      const blueprint = sanitizeBlueprint(normalizeBlueprint(parsed));
       res.json({ blueprint });
     } catch (err: unknown) {
       const message =
