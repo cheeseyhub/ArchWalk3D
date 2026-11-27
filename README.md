@@ -13,9 +13,7 @@
 
 ## Live Links
 
-- **Development Environment:** https://ais-dev-4uykxg4zwp4jijhotuu4re-598168739165.asia-southeast1.run.app
-- **Shared Preview:** https://ais-pre-4uykxg4zwp4jijhotuu4re-598168739165.asia-southeast1.run.app
-
+-- **Live Link :** (https://archwalk-3d.ai.studio)
 > **Note:** ArchWalk 3D requires Google Sign-In via Firebase Authentication to save generated blueprints and custom furniture packs to your private cloud workspace.
 
 ---
