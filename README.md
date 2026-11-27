@@ -210,3 +210,5 @@ npm run build
 
 - **Server-Side API Keys:** `GEMINI_API_KEY` is read strictly on the Express backend (`server.ts`) and never exposed to client bundles.
 - **Authenticated Cloud Storage:** All saved blueprints (`blueprints`) and generated furniture packs (`furnitureAssets`) are scoped by authenticated user UID and enforced by `firestore.rules`.
+
+## By PIEAS STUDENTS 
