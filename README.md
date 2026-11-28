@@ -1,6 +1,7 @@
 # ArchWalk 3D
 
-**Convert architectural floor plans, building exteriors, and room photos into interactive, walkable 3D architectural models pow
+**Convert architectural floor plans, building exteriors, and room photos into interactive, walkable 3D architectural models**
+
 [![Three.js](https://img.shields.io/badge/Three.js-WebGL-000000?style=flat-square&logo=threedotjs)](https://threejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178c6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Firebase](https://img.shields.io/badge/Firebase-Auth%20%26%20Firestore-ffca28?style=flat-square&logo=firebase&logoColor=black)](https://firebase.google.com/)
